@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+id = "dlss5_nr"
+version = "0.1.0"
+name = "DLSS 5 Neural Rendering"
+tagline = "Denoise Render Result with experimental NVIDIA DLSS 5 NR"
+maintainer = "DLSS5-NR contributors"
+type = "add-on"
+
+website = "https://github.com/lisitskyaa/ComfyUI-DLSS5-NR"
+tags = ["Render"]
+blender_version_min = "5.0.0"
+license = ["SPDX:MIT"]
+platforms = ["windows-x64"]
+
+[permissions]
+files = "Load user-supplied NVIDIA runtime and project-owned native DLLs"
