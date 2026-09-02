@@ -1,0 +1,484 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 19eae0d..95f6017 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -632,6 +632,10 @@ option(WITH_CYCLES_OSL "Build Cycles with OpenShadingLanguage support" ON)
+ option(WITH_CYCLES_PATH_GUIDING "Build Cycles with path guiding support" ON)
+ option(WITH_CYCLES_EMBREE "Build Cycles with Embree support" ON)
+ option(WITH_CYCLES_DEBUG "Build Cycles with options useful for debugging (e.g., MIS)" OFF)
++option(WITH_CYCLES_DLSS5_NR "Build experimental Windows-only DLSS 5 NR denoiser" OFF)
++if(WITH_CYCLES_DLSS5_NR AND NOT WIN32)
++  message(FATAL_ERROR "WITH_CYCLES_DLSS5_NR is supported only on Windows")
++endif()
+ 
+ option(WITH_CYCLES_STANDALONE "Build Cycles standalone application" OFF)
+ option(WITH_CYCLES_STANDALONE_GUI "Build Cycles standalone with GUI" OFF)
+diff --git a/intern/cycles/CMakeLists.txt b/intern/cycles/CMakeLists.txt
+index e7b7709..e253e33 100644
+--- a/intern/cycles/CMakeLists.txt
++++ b/intern/cycles/CMakeLists.txt
+@@ -216,6 +216,9 @@ include_directories(
+ if(WITH_CYCLES_DEBUG)
+   add_definitions(-DWITH_CYCLES_DEBUG)
+ endif()
++if(WITH_CYCLES_DLSS5_NR)
++  add_definitions(-DWITH_CYCLES_DLSS5_NR)
++endif()
+ if(WITH_CYCLES_STANDALONE_GUI)
+   add_definitions(-DWITH_CYCLES_STANDALONE_GUI)
+ endif()
+diff --git a/intern/cycles/blender/addon/properties.py b/intern/cycles/blender/addon/properties.py
+index a37d057..c7def35 100644
+--- a/intern/cycles/blender/addon/properties.py
++++ b/intern/cycles/blender/addon/properties.py
+@@ -270,6 +270,13 @@ def enum_openimagedenoise_denoiser(self, context):
+     return []
+ 
+ 
++def enum_dlss5nr_denoiser(self, context):
++    import _cycles
++    if _cycles.with_dlss5nr and (not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('OPTIX'))):
++        return [('DLSS5NR', "DLSS 5 NR (Experimental)", n_("Use experimental same-resolution DLSS 5 noise reduction; requires external runtime"), 8)]
++    return []
++
++
+ def enum_optix_denoiser(self, context):
+     if not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('OPTIX')):
+         return [('OPTIX', "OptiX", n_(
+@@ -291,6 +298,7 @@ def enum_preview_denoiser(self, context):
+     else:
+         items = [('AUTO', "None", n_("Blender was compiled without a viewport denoiser"), 0)]
+ 
++    items += enum_dlss5nr_denoiser(self, context)
+     items += optix_items
+     items += oidn_items
+     return items
+@@ -298,6 +306,7 @@ def enum_preview_denoiser(self, context):
+ 
+ def enum_denoiser(self, context):
+     items = []
++    items += enum_dlss5nr_denoiser(self, context)
+     items += enum_optix_denoiser(self, context)
+     items += enum_openimagedenoise_denoiser(self, context)
+     return items
+diff --git a/intern/cycles/blender/python.cpp b/intern/cycles/blender/python.cpp
+index 7468bb0..9e4c54c 100644
+--- a/intern/cycles/blender/python.cpp
++++ b/intern/cycles/blender/python.cpp
+@@ -853,6 +853,12 @@ void *CCL_python_module_init()
+   PyModule_AddObjectRef(mod, "with_embree_gpu", Py_False);
+ #endif /* WITH_EMBREE_GPU */
+ 
++#ifdef WITH_CYCLES_DLSS5_NR
++  PyModule_AddObjectRef(mod, "with_dlss5nr", Py_True);
++#else
++  PyModule_AddObjectRef(mod, "with_dlss5nr", Py_False);
++#endif
++
+   if (ccl::openimagedenoise_supported()) {
+     PyModule_AddObjectRef(mod, "with_openimagedenoise", Py_True);
+   }
+diff --git a/intern/cycles/device/denoise.cpp b/intern/cycles/device/denoise.cpp
+index 3833a12..852fea1 100644
+--- a/intern/cycles/device/denoise.cpp
++++ b/intern/cycles/device/denoise.cpp
+@@ -13,6 +13,8 @@ const char *denoiserTypeToHumanReadable(DenoiserType type)
+       return "OptiX";
+     case DENOISER_OPENIMAGEDENOISE:
+       return "OpenImageDenoise";
++    case DENOISER_DLSS5NR:
++      return "DLSS 5 NR (Experimental)";
+ 
+     case DENOISER_NUM:
+     case DENOISER_NONE:
+@@ -30,6 +32,7 @@ const NodeEnum *DenoiseParams::get_type_enum()
+   if (type_enum.empty()) {
+     type_enum.insert("optix", DENOISER_OPTIX);
+     type_enum.insert("openimageio", DENOISER_OPENIMAGEDENOISE);
++    type_enum.insert("dlss5nr", DENOISER_DLSS5NR);
+   }
+ 
+   return &type_enum;
+diff --git a/intern/cycles/device/denoise.h b/intern/cycles/device/denoise.h
+index e907b8a..742dc4c 100644
+--- a/intern/cycles/device/denoise.h
++++ b/intern/cycles/device/denoise.h
+@@ -11,6 +11,7 @@ CCL_NAMESPACE_BEGIN
+ enum DenoiserType {
+   DENOISER_OPTIX = 2,
+   DENOISER_OPENIMAGEDENOISE = 4,
++  DENOISER_DLSS5NR = 8,
+   DENOISER_NUM,
+ 
+   DENOISER_NONE = 0,
+diff --git a/intern/cycles/device/optix/device.cpp b/intern/cycles/device/optix/device.cpp
+index 606c203..64abd1d 100644
+--- a/intern/cycles/device/optix/device.cpp
++++ b/intern/cycles/device/optix/device.cpp
+@@ -83,6 +83,9 @@ void device_optix_info(const vector<DeviceInfo> &cuda_devices, vector<DeviceInfo
+     info.has_osl = true;
+ #  endif
+     info.denoisers |= DENOISER_OPTIX;
++#  ifdef WITH_CYCLES_DLSS5_NR
++    info.denoisers |= DENOISER_DLSS5NR;
++#  endif
+ #  if defined(WITH_OPENIMAGEDENOISE)
+ #    if OIDN_VERSION >= 20300
+     if (oidnIsCUDADeviceSupported(info.num)) {
+diff --git a/intern/cycles/integrator/CMakeLists.txt b/intern/cycles/integrator/CMakeLists.txt
+index 4ac700d..a352651 100644
+--- a/intern/cycles/integrator/CMakeLists.txt
++++ b/intern/cycles/integrator/CMakeLists.txt
+@@ -66,6 +66,11 @@ set(LIB
+   cycles_util
+ )
+ 
++if(WITH_CYCLES_DLSS5_NR)
++  list(APPEND SRC denoiser_dlss5nr.cpp)
++  list(APPEND SRC_HEADERS denoiser_dlss5nr.h)
++endif()
++
+ if(WITH_OPENIMAGEDENOISE)
+   list(APPEND LIB
+     ${OPENIMAGEDENOISE_LIBRARIES}
+diff --git a/intern/cycles/integrator/denoiser.cpp b/intern/cycles/integrator/denoiser.cpp
+index b579111..a94a9b2 100644
+--- a/intern/cycles/integrator/denoiser.cpp
++++ b/intern/cycles/integrator/denoiser.cpp
+@@ -7,6 +7,9 @@
+ #include "device/device.h"
+ 
+ #include "integrator/denoiser_oidn.h"
++#ifdef WITH_CYCLES_DLSS5_NR
++#  include "integrator/denoiser_dlss5nr.h"
++#endif
+ #include "session/display_driver.h"
+ #ifdef WITH_OPENIMAGEDENOISE
+ #  include "integrator/denoiser_oidn_gpu.h"
+@@ -90,6 +93,18 @@ bool use_optix_denoiser(Device *denoiser_device, const DenoiseParams &params)
+ #endif
+ }
+ 
++bool use_dlss5nr_denoiser(Device *denoiser_device, const DenoiseParams &params)
++{
++#ifdef WITH_CYCLES_DLSS5_NR
++  return params.type == DENOISER_DLSS5NR &&
++         DLSS5NRDenoiser::is_device_supported(denoiser_device->info);
++#else
++  (void)denoiser_device;
++  (void)params;
++  return false;
++#endif
++}
++
+ bool use_gpu_oidn_denoiser(Device *denoiser_device, const DenoiseParams &params)
+ {
+ #ifdef WITH_OPENIMAGEDENOISE
+@@ -131,6 +146,7 @@ DenoiseParams get_effective_denoise_params(Device *denoiser_device,
+   const bool is_cpu_denoiser_device = single_denoiser_device->info.type == DEVICE_CPU;
+   if (is_cpu_denoiser_device == false) {
+     if (use_optix_denoiser(single_denoiser_device, effective_denoise_params) ||
++        use_dlss5nr_denoiser(single_denoiser_device, effective_denoise_params) ||
+         use_gpu_oidn_denoiser(single_denoiser_device, effective_denoise_params))
+     {
+       /* Denoising parameters are correct and there is no need to fall back to CPU OIDN. */
+@@ -157,6 +173,12 @@ unique_ptr<Denoiser> Denoiser::create(Device *denoiser_device,
+ 
+   const bool is_cpu_denoiser_device = single_denoiser_device->info.type == DEVICE_CPU;
+   if (is_cpu_denoiser_device == false) {
++#ifdef WITH_CYCLES_DLSS5_NR
++    if (use_dlss5nr_denoiser(single_denoiser_device, effective_denoiser_params)) {
++      return make_unique<DLSS5NRDenoiser>(single_denoiser_device, effective_denoiser_params);
++    }
++#endif
++
+ #ifdef WITH_OPTIX
+     if (use_optix_denoiser(single_denoiser_device, effective_denoiser_params)) {
+       return make_unique<OptiXDenoiser>(single_denoiser_device, effective_denoiser_params);
+diff --git a/intern/cycles/integrator/denoiser_dlss5nr.cpp b/intern/cycles/integrator/denoiser_dlss5nr.cpp
+new file mode 100644
+index 0000000..22132ee
+--- /dev/null
++++ b/intern/cycles/integrator/denoiser_dlss5nr.cpp
+@@ -0,0 +1,200 @@
++/* SPDX-FileCopyrightText: 2026 Blender DLSS5 NR contributors
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++#include "integrator/denoiser_dlss5nr.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <vector>
++
++#include "device/device.h"
++#include "session/buffers.h"
++#include "util/log.h"
++
++CCL_NAMESPACE_BEGIN
++
++DLSS5NRDenoiser::DLSS5NRDenoiser(Device *denoiser_device, const DenoiseParams &params)
++    : Denoiser(denoiser_device, params)
++{
++  DCHECK_EQ(params.type, DENOISER_DLSS5NR);
++}
++
++DLSS5NRDenoiser::~DLSS5NRDenoiser()
++{
++  unload_runtime();
++}
++
++uint DLSS5NRDenoiser::get_device_type_mask() const
++{
++  return DEVICE_MASK_OPTIX | DEVICE_MASK_CUDA;
++}
++
++bool DLSS5NRDenoiser::is_device_supported(const DeviceInfo &device)
++{
++#ifdef _WIN32
++  return device.type == DEVICE_OPTIX || device.type == DEVICE_CUDA;
++#else
++  (void)device;
++  return false;
++#endif
++}
++
++bool DLSS5NRDenoiser::ensure_runtime()
++{
++#ifdef _WIN32
++  if (initialized_) {
++    return true;
++  }
++  if (failed_) {
++    return false;
++  }
++
++  const char *bridge_path = std::getenv("CYCLES_DLSS5NR_BRIDGE");
++  bridge_module_ = LoadLibraryA(bridge_path && bridge_path[0] ? bridge_path :
++                                                              "dlss5nr_bridge.dll");
++  if (!bridge_module_) {
++    set_error("DLSS 5 NR: dlss5nr_bridge.dll was not found. Set CYCLES_DLSS5NR_BRIDGE.");
++    failed_ = true;
++    return false;
++  }
++
++  init_ = reinterpret_cast<InitFn>(GetProcAddress(bridge_module_, "dlss5nr_init"));
++  process_ = reinterpret_cast<ProcessFn>(GetProcAddress(bridge_module_, "dlss5nr_process"));
++  shutdown_ = reinterpret_cast<ShutdownFn>(GetProcAddress(bridge_module_, "dlss5nr_shutdown"));
++  if (!init_ || !process_ || !shutdown_) {
++    set_error("DLSS 5 NR: bridge has missing or incompatible exports.");
++    unload_runtime();
++    failed_ = true;
++    return false;
++  }
++
++  const char *runtime_path = std::getenv("CYCLES_DLSS5NR_RUNTIME");
++  if (!runtime_path || !runtime_path[0]) {
++    set_error("DLSS 5 NR: set CYCLES_DLSS5NR_RUNTIME to directory containing nvngx_dlssnr.dll.");
++    failed_ = true;
++    return false;
++  }
++
++  const int required = MultiByteToWideChar(CP_UTF8, 0, runtime_path, -1, nullptr, 0);
++  std::vector<wchar_t> runtime_wide(std::max(required, 1));
++  if (!required || !MultiByteToWideChar(
++                       CP_UTF8, 0, runtime_path, -1, runtime_wide.data(), runtime_wide.size()))
++  {
++    set_error("DLSS 5 NR: CYCLES_DLSS5NR_RUNTIME is not valid UTF-8.");
++    failed_ = true;
++    return false;
++  }
++
++  char error[1024] = {};
++  if (!init_(0, runtime_wide.data(), error, sizeof(error))) {
++    set_error(string("DLSS 5 NR initialization failed: ") + error);
++    failed_ = true;
++    return false;
++  }
++  initialized_ = true;
++  LOG_INFO << "DLSS 5 NR experimental bridge initialized";
++  return true;
++#else
++  set_error("DLSS 5 NR is only supported on Windows x64.");
++  return false;
++#endif
++}
++
++void DLSS5NRDenoiser::unload_runtime()
++{
++#ifdef _WIN32
++  if (initialized_ && shutdown_) {
++    shutdown_();
++  }
++  initialized_ = false;
++  init_ = nullptr;
++  process_ = nullptr;
++  shutdown_ = nullptr;
++  if (bridge_module_) {
++    FreeLibrary(bridge_module_);
++    bridge_module_ = nullptr;
++  }
++#endif
++}
++
++bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
++                                     RenderBuffers *render_buffers,
++                                     const int num_samples,
++                                     bool /*allow_inplace_modification*/)
++{
++  if (!ensure_runtime()) {
++    return false;
++  }
++  if (buffer_params.width <= 0 || buffer_params.height <= 0 || num_samples <= 0) {
++    return true;
++  }
++
++  const int noisy_offset = buffer_params.get_pass_offset(PASS_COMBINED, PassMode::NOISY);
++  const int output_offset = buffer_params.get_pass_offset(PASS_COMBINED, PassMode::DENOISED);
++  if (noisy_offset == PASS_UNUSED || output_offset == PASS_UNUSED) {
++    set_error("DLSS 5 NR: Combined noisy or denoised pass is missing.");
++    return false;
++  }
++
++  render_buffers->copy_from_device();
++  float *pixels = render_buffers->buffer.data();
++  const size_t pixel_count = size_t(buffer_params.width) * size_t(buffer_params.height);
++  std::vector<float> input(pixel_count * 3);
++  std::vector<float> output(pixel_count * 3);
++  const float sample_scale = 1.0f / float(num_samples);
++
++  for (int y = 0; y < buffer_params.height; ++y) {
++    for (int x = 0; x < buffer_params.width; ++x) {
++      const size_t image_index = size_t(y) * buffer_params.width + x;
++      const size_t buffer_index = size_t(buffer_params.offset + y * buffer_params.stride + x) *
++                                  buffer_params.pass_stride;
++      for (int channel = 0; channel < 3; ++channel) {
++        input[image_index * 3 + channel] =
++            std::max(0.0f, pixels[buffer_index + noisy_offset + channel] * sample_scale);
++      }
++    }
++  }
++
++  char error[1024] = {};
++  const bool reset = width_ != buffer_params.width || height_ != buffer_params.height;
++  if (!process_(input.data(),
++                output.data(),
++                buffer_params.width,
++                buffer_params.height,
++                0,
++                0,
++                1.0f,
++                0.0f,
++                0.0f,
++                0.0f,
++                0,
++                reset ? 1 : 0,
++                error,
++                sizeof(error)))
++  {
++    set_error(string("DLSS 5 NR evaluation failed: ") + error);
++    failed_ = true;
++    unload_runtime();
++    return false;
++  }
++  width_ = buffer_params.width;
++  height_ = buffer_params.height;
++
++  for (int y = 0; y < buffer_params.height; ++y) {
++    for (int x = 0; x < buffer_params.width; ++x) {
++      const size_t image_index = size_t(y) * buffer_params.width + x;
++      const size_t buffer_index = size_t(buffer_params.offset + y * buffer_params.stride + x) *
++                                  buffer_params.pass_stride;
++      for (int channel = 0; channel < 3; ++channel) {
++        pixels[buffer_index + output_offset + channel] = output[image_index * 3 + channel];
++      }
++      pixels[buffer_index + output_offset + 3] =
++          pixels[buffer_index + noisy_offset + 3] * sample_scale;
++    }
++  }
++  render_buffers->copy_to_device();
++  return true;
++}
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/integrator/denoiser_dlss5nr.h b/intern/cycles/integrator/denoiser_dlss5nr.h
+new file mode 100644
+index 0000000..c29a198
+--- /dev/null
++++ b/intern/cycles/integrator/denoiser_dlss5nr.h
+@@ -0,0 +1,63 @@
++/* SPDX-FileCopyrightText: 2026 Blender DLSS5 NR contributors
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++#include "integrator/denoiser.h"
++
++#ifdef _WIN32
++#  include <windows.h>
++#endif
++
++CCL_NAMESPACE_BEGIN
++
++class DLSS5NRDenoiser final : public Denoiser {
++ public:
++  DLSS5NRDenoiser(Device *denoiser_device, const DenoiseParams &params);
++  ~DLSS5NRDenoiser() override;
++
++  bool denoise_buffer(const BufferParams &buffer_params,
++                      RenderBuffers *render_buffers,
++                      int num_samples,
++                      bool allow_inplace_modification) override;
++
++  static bool is_device_supported(const DeviceInfo &device);
++
++ protected:
++  uint get_device_type_mask() const override;
++
++ private:
++  bool ensure_runtime();
++  void unload_runtime();
++
++#ifdef _WIN32
++  using InitFn = int(__cdecl *)(int, const wchar_t *, char *, int);
++  using ProcessFn = int(__cdecl *)(const float *,
++                                   float *,
++                                   int,
++                                   int,
++                                   int,
++                                   int,
++                                   float,
++                                   float,
++                                   float,
++                                   float,
++                                   int,
++                                   int,
++                                   char *,
++                                   int);
++  using ShutdownFn = void(__cdecl *)();
++
++  HMODULE bridge_module_ = nullptr;
++  InitFn init_ = nullptr;
++  ProcessFn process_ = nullptr;
++  ShutdownFn shutdown_ = nullptr;
++#endif
++  bool initialized_ = false;
++  bool failed_ = false;
++  int width_ = 0;
++  int height_ = 0;
++};
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/scene/integrator.cpp b/intern/cycles/scene/integrator.cpp
+index eef15d0..ff44895 100644
+--- a/intern/cycles/scene/integrator.cpp
++++ b/intern/cycles/scene/integrator.cpp
+@@ -136,6 +136,7 @@ NODE_DEFINE(Integrator)
+   denoiser_type_enum.insert("none", DENOISER_NONE);
+   denoiser_type_enum.insert("optix", DENOISER_OPTIX);
+   denoiser_type_enum.insert("openimagedenoise", DENOISER_OPENIMAGEDENOISE);
++  denoiser_type_enum.insert("dlss5nr", DENOISER_DLSS5NR);
+ 
+   static NodeEnum denoiser_prefilter_enum;
+   denoiser_prefilter_enum.insert("none", DENOISER_PREFILTER_NONE);

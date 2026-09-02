@@ -1,47 +1,60 @@
-# Blender DLSS 5 Neural Rendering
+# Blender 5.0.1 DLSS 5 NR experimental patchset
 
-Unofficial, experimental Blender 5.x extension that denoises current **Render Result** in-process with NVIDIA DLSS 5 Neural Rendering (NGX feature 18). Output is written to a separate float image named `DLSS 5 NR Result`; original render stays untouched.
+This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5 NR (Experimental)** denoiser for final renders and rendered viewport updates. It uses the undocumented dynamic NGX ABI approach from [ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR), not NVIDIA's official DLSS/Streamline SDK.
 
-Based on MIT-licensed native bridge work from [ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR). This project is not affiliated with or endorsed by NVIDIA or Blender Foundation.
+## Important limitations
 
-## Requirements
-
-- Windows 10/11 x64
-- Blender 5.x
-- NVIDIA RTX GPU and recent NVIDIA driver
-- Visual Studio 2022 Build Tools with **Desktop development with C++**
-- Legally obtained compatible `nvngx_dlssnr.dll`
-
-This is same-resolution post-processing, not DLSS Super Resolution.
+- Windows x64 and NVIDIA RTX only.
+- Same-resolution, color-only noise reduction. This is not full temporal DLSS Ray Reconstruction.
+- Current ABI does not consume Cycles albedo, normal, depth, motion, or exposure guides.
+- HDR values are constrained by reference bridge's normalized FP16 staging path.
+- Runtime compatibility is not guaranteed. Failure returns control to Cycles instead of crashing Blender, but output quality and stability require hardware testing.
+- `nvngx_dlssnr.dll` and `_nvngx.dll` are proprietary and never included.
 
 ## Build
 
-1. Place `nvngx_dlssnr.dll` in `runtime/`. Never commit or redistribute it.
-2. Run `build_native.bat` on Windows. This creates:
-   - `native/bin/dlss5nr_bridge.dll`
-   - `runtime/caller/nvngx.dll_blender.dll`
-3. Run `package_extension.bat`. Output appears in `dist/`.
+Requirements: Windows 11, Visual Studio 2022 with Desktop C++ workload, Git, Subversion, CMake, compatible NVIDIA driver, and enough disk space for Blender build.
 
-`_nvngx.dll` is normally found in NVIDIA DriverStore. For troubleshooting only, a compatible local copy may be placed in `runtime/`.
+Run from **x64 Native Tools Command Prompt for VS 2022**:
 
-## Install and use
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\fetch_blender.ps1
+powershell -ExecutionPolicy Bypass -File scripts\apply_patch.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+```
 
-1. In Blender: **Edit > Preferences > Get Extensions > Install from Disk**.
-2. Select generated ZIP and enable extension.
-3. Render still image.
-4. Open Image Editor, then sidebar (`N`) > **DLSS 5 NR**.
-5. Choose settings and click **Denoise Render Result**.
+Scripts pin Blender to commit `a3db93c5b2595a79f65f304114c23aeef8c2139f` (`v5.0.1`). `WITH_CYCLES_DLSS5_NR` defaults to `OFF`; build script enables it.
 
-Every click resets temporal state because operator processes one still image. `Auto` channels handles known RGBA/BGRA differences between runtime builds.
+## Runtime setup
 
-## Troubleshooting
+Follow [RUNTIME_SETUP.md](RUNTIME_SETUP.md). Then choose **DLSS 5 NR (Experimental)** under Cycles render denoising or viewport denoising. Existing OptiX and OpenImageDenoise defaults remain unchanged.
 
-- **Native bridge missing**: run `build_native.bat`, package again, reinstall.
-- **Runtime missing**: place `nvngx_dlssnr.dll` in extension `runtime/` before packaging.
-- **NGX core unavailable**: update NVIDIA driver or test compatible `_nvngx.dll` local override.
-- **Wrong red/blue channels**: choose `RGBA` or `BGRA` manually.
-- **Feature creation/evaluation failed**: runtime, driver, or GPU may be incompatible.
+## Package
 
-## Warning
+After successful build, pass directory containing `blender.exe`:
 
-Feature uses undocumented NVIDIA interfaces. It may fail, produce incorrect output, or crash Blender. Save work before processing. Proprietary NVIDIA binaries and SDK headers are intentionally excluded; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -BlenderBin "C:\path\to\blender-build\bin\Release"
+```
+
+Packager refuses to include proprietary NVIDIA runtime DLLs.
+
+## Verification
+
+```bash
+python -m unittest discover -s tests -v
+python tools/check_no_proprietary_binaries.py
+```
+
+Windows RTX smoke test:
+
+1. Start patched Blender from shell containing both runtime environment variables.
+2. Select Cycles with an OptiX device.
+3. Select DLSS 5 NR for final render and verify Combined denoised pass.
+4. Select it for viewport denoising and test camera movement and resize.
+5. Remove runtime path and confirm Blender reports error without terminating.
+6. Retest OptiX and OpenImageDenoise.
+
+## License
+
+Patch integration code uses Blender-compatible SPDX headers. Adapted bridge and caller shim retain MIT attribution from ComfyUI-DLSS5-NR. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.

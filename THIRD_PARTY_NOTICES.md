@@ -1,19 +1,15 @@
-# Third-Party Notices
+# Third-party notices
+
+## Blender and Cycles
+
+Generated patch targets Blender `v5.0.1`. Blender is GPL-licensed; Cycles source files carry Apache-2.0 SPDX notices. Distributing a compiled modified Blender build requires compliance with Blender's applicable licenses and source-availability obligations.
 
 ## ComfyUI-DLSS5-NR
 
-Native bridge and caller shim derive from the MIT-licensed [lisitskyaa/ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR), copyright 2026 ComfyUI-DLSS5-NR contributors. MIT terms are preserved in `LICENSE` and source headers.
+`source/dlss5nr/dlss5nr_bridge.cpp` and `source/dlss5nr/caller_shim.cpp` are adapted from [lisitskyaa/ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR), licensed under MIT. Copyright and permission text is preserved in `LICENSE`.
 
-## NVIDIA
+## NVIDIA runtime
 
-NVIDIA, DLSS, NGX, GeForce, and related names and trademarks belong to NVIDIA Corporation and/or its affiliates.
+DLSS, NVIDIA, NGX, Streamline, and related names are trademarks of NVIDIA Corporation. NVIDIA SDK headers, libraries, models, `nvngx_dlssnr.dll`, and `_nvngx.dll` are not included. Users must obtain compatible runtime files independently and comply with NVIDIA's terms.
 
-This repository and release package do not include NVIDIA proprietary runtime binaries or NVIDIA NGX SDK headers, including `_nvngx.dll` and `nvngx_dlssnr.dll`. Users must obtain compatible NVIDIA software legally and comply with its license. Minimal ABI declarations in project-owned bridge source do not grant rights in NVIDIA software, APIs, trademarks, or binaries.
-
-Reference: https://github.com/NVIDIA/DLSS
-
-## Blender
-
-Blender is a separate Blender Foundation project. This extension is unofficial and not endorsed by Blender Foundation.
-
-Reference: https://www.blender.org/
+This project is unofficial and is not endorsed by Blender Foundation or NVIDIA.
