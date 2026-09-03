@@ -8,8 +8,7 @@ $Required = @(
     'blender_manifest.toml', '__init__.py', 'native_bridge.py', 'operators.py',
     'pixels.py', 'properties.py', 'ui.py', 'LICENSE', 'README.md',
     'THIRD_PARTY_NOTICES.md', 'native\bin\dlss5nr_bridge.dll',
-    'runtime\caller\nvngx.dll_blender.dll',
-    'runtime\caller\nvngx.dll_comfy.dll'
+    'runtime\caller\nvngx.dll_blender.dll'
 )
 foreach ($Relative in $Required) {
     if (-not (Test-Path (Join-Path $Root $Relative))) {

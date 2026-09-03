@@ -11,6 +11,7 @@
 #include "device/device.h"
 #include "session/buffers.h"
 #include "util/log.h"
+#include "util/math.h"
 
 CCL_NAMESPACE_BEGIN
 
@@ -137,21 +138,34 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
     return false;
   }
 
+  /* Render buffers hold accumulated sums, so passes are divided by the sample
+   * count going in and multiplied back going out, exactly as the built-in
+   * filter_color_preprocess / filter_color_postprocess kernels do. With
+   * adaptive sampling the count is per pixel, not the scene-wide num_samples. */
+  const int sample_count_offset = buffer_params.get_pass_offset(PASS_SAMPLE_COUNT);
+
   render_buffers->copy_from_device();
   float *pixels = render_buffers->buffer.data();
   const size_t pixel_count = size_t(buffer_params.width) * size_t(buffer_params.height);
   std::vector<float> input(pixel_count * 3);
   std::vector<float> output(pixel_count * 3);
-  const float sample_scale = 1.0f / float(num_samples);
+  std::vector<float> pixel_scale(pixel_count, float(num_samples));
 
   for (int y = 0; y < buffer_params.height; ++y) {
     for (int x = 0; x < buffer_params.width; ++x) {
       const size_t image_index = size_t(y) * buffer_params.width + x;
       const size_t buffer_index = size_t(buffer_params.offset + y * buffer_params.stride + x) *
                                   buffer_params.pass_stride;
+      if (sample_count_offset != PASS_UNUSED) {
+        pixel_scale[image_index] = float(
+            __float_as_uint(pixels[buffer_index + sample_count_offset]));
+      }
+      const float inv_scale = pixel_scale[image_index] > 0.0f ?
+                                  1.0f / pixel_scale[image_index] :
+                                  0.0f;
       for (int channel = 0; channel < 3; ++channel) {
         input[image_index * 3 + channel] =
-            std::max(0.0f, pixels[buffer_index + noisy_offset + channel] * sample_scale);
+            std::max(0.0f, pixels[buffer_index + noisy_offset + channel] * inv_scale);
       }
     }
   }
@@ -162,13 +176,13 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
                 output.data(),
                 buffer_params.width,
                 buffer_params.height,
-                0,
-                0,
-                1.0f,
-                0.0f,
-                0.0f,
-                0.0f,
-                0,
+                0,    /* style: Default */
+                0,    /* preset: Default */
+                1.0f, /* intensity */
+                1.0f, /* local tone strength */
+                1.0f, /* local structure strength */
+                -1.0f, /* skin structure: negative leaves the model default */
+                0,    /* auto mask */
                 reset ? 1 : 0,
                 error,
                 sizeof(error)))
@@ -187,10 +201,10 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
       const size_t buffer_index = size_t(buffer_params.offset + y * buffer_params.stride + x) *
                                   buffer_params.pass_stride;
       for (int channel = 0; channel < 3; ++channel) {
-        pixels[buffer_index + output_offset + channel] = output[image_index * 3 + channel];
+        pixels[buffer_index + output_offset + channel] = output[image_index * 3 + channel] *
+                                                        pixel_scale[image_index];
       }
-      pixels[buffer_index + output_offset + 3] =
-          pixels[buffer_index + noisy_offset + 3] * sample_scale;
+      pixels[buffer_index + output_offset + 3] = pixels[buffer_index + noisy_offset + 3];
     }
   }
   render_buffers->copy_to_device();

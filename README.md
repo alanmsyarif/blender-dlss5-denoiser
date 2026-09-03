@@ -4,10 +4,9 @@ This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5
 
 ## Important limitations
 
-- Windows x64 and NVIDIA RTX only.
-- Same-resolution, color-only noise reduction. This is not full temporal DLSS Ray Reconstruction.
-- Current ABI does not consume Cycles albedo, normal, depth, motion, or exposure guides.
-- HDR values are constrained by reference bridge's normalized FP16 staging path.
+- Windows x64 and NVIDIA RTX only. RTX 20 and non-RTX are not supported; Ada and Blackwell are the primary targets and Ampere is slow.
+- This integration runs same-resolution and colour-only. That is a limit of this integration, not of the ABI: feature 18 also exposes `DLSSNR.Depth`, `DLSSNR.MVec` and an upscaling path. Cycles depth and motion guides are not wired up yet, so cleared guide textures are bound and the model behaves as a single-frame spatial denoiser. This is not full temporal DLSS Ray Reconstruction.
+- HDR values are constrained by the bridge's normalized FP16 staging path: colour is clamped to 0..1, encoded to sRGB for the model, and decoded back to linear. Anything above 1.0 in the render is crushed before denoising.
 - Runtime compatibility is not guaranteed. Failure returns control to Cycles instead of crashing Blender, but output quality and stability require hardware testing.
 - `nvngx_dlssnr.dll` and `_nvngx.dll` are proprietary and never included.
 
@@ -54,6 +53,10 @@ Windows RTX smoke test:
 4. Select it for viewport denoising and test camera movement and resize.
 5. Remove runtime path and confirm Blender reports error without terminating.
 6. Retest OptiX and OpenImageDenoise.
+
+## References
+
+Parameter names, the capability-block calling convention, and the caller-gate approach were recovered by [DaniilSokolyuk/video2dlssnr](https://github.com/DaniilSokolyuk/video2dlssnr). Runtime version pinning and GPU gating follow [Merserk/dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer). Neither project is affiliated with this one.
 
 ## License
 

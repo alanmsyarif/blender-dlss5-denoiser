@@ -11,10 +11,6 @@ class DLSS5NRSettings(bpy.types.PropertyGroup):
             ("1", "Natural", "Natural reconstruction"),
             ("2", "Cinematic", "Cinematic reconstruction"),
             ("0", "Default", "Runtime default"),
-            ("3", "Style 3", "Experimental style 3"),
-            ("4", "Style 4", "Experimental style 4"),
-            ("5", "Style 5", "Experimental style 5"),
-            ("6", "Style 6", "Experimental style 6"),
         ],
         default="1",
     )

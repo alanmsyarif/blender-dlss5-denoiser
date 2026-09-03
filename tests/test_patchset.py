@@ -27,6 +27,27 @@ class PatchsetTests(unittest.TestCase):
         for script in ("fetch_blender.ps1", "apply_patch.ps1"):
             self.assertIn(expected, (ROOT / "scripts" / script).read_text(encoding="utf-8"))
 
+    def test_patch_has_no_crlf(self):
+        # git apply matches context byte-for-byte; a CRLF checkout fails every
+        # hunk. .gitattributes marks *.patch -text to keep it that way.
+        self.assertNotIn(b"\r\n", PATCH.read_bytes())
+
+    def test_patch_matches_denoiser_sources(self):
+        lines = PATCH.read_text(encoding="utf-8").split("\n")
+        for name in ("denoiser_dlss5nr.h", "denoiser_dlss5nr.cpp"):
+            start = next(
+                i for i, line in enumerate(lines)
+                if line.startswith("+++ b/") and line.endswith(name)
+            ) + 2
+            end = start
+            while end < len(lines) and lines[end].startswith("+"):
+                end += 1
+            embedded = [line[1:] for line in lines[start:end]]
+            on_disk = (ROOT / "source/dlss5nr" / name).read_text(encoding="utf-8").split("\n")
+            if on_disk and on_disk[-1] == "":
+                on_disk = on_disk[:-1]
+            self.assertEqual(embedded, on_disk, f"{name} has drifted from the patch")
+
 
 if __name__ == "__main__":
     unittest.main()

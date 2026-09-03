@@ -120,11 +120,11 @@ function Run-Cl([string[]]$Arguments, [string]$StepName) {
 $common = @('/nologo','/std:c++17','/EHsc','/MT','/LD')
 foreach ($inc in $includeDirs) { $common += ('/I' + $inc) }
 
-$callerCpp = Join-Path $Native 'caller_shim.cpp'
+$callerCpp = Join-Path $Root 'source\dlss5nr\caller_shim.cpp'
 $callerDll = Join-Path $CallerOut 'nvngx.dll_blender.dll'
 Run-Cl ($common + @('/Od', $callerCpp, '/link', ('/OUT:' + $callerDll)) + ($libDirs | ForEach-Object { '/LIBPATH:' + $_ })) '[1/2] Building caller shim...'
 
-$bridgeCpp = Join-Path $Native 'dlss5nr_bridge.cpp'
+$bridgeCpp = Join-Path $Root 'source\dlss5nr\dlss5nr_bridge.cpp'
 $bridgeDll = Join-Path $Bin 'dlss5nr_bridge.dll'
 Run-Cl ($common + @('/O2', $bridgeCpp, '/link', ('/OUT:' + $bridgeDll), 'd3d12.lib', 'dxgi.lib', 'ole32.lib') + ($libDirs | ForEach-Object { '/LIBPATH:' + $_ })) '[2/2] Building in-process Blender bridge...'
 

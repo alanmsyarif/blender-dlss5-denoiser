@@ -1,0 +1,3 @@
+# git apply matches context literally: a CRLF checkout breaks every hunk.
+*.patch -text
+*.diff -text

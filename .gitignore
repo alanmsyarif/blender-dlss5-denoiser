@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+
+# Build outputs
+native/bin/
+runtime/caller/
+build/
+dist/
+blender-src/
+
+# MSVC intermediates
+*.obj
+*.exp
+*.lib
+*.pdb
+
+# Never commit the NVIDIA runtime
+runtime/nvngx_dlssnr.dll
+runtime/_nvngx.dll
