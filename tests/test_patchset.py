@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -17,10 +19,16 @@ class PatchsetTests(unittest.TestCase):
         ):
             self.assertIn(marker, text)
 
-    def test_runtime_binary_is_not_bundled(self):
-        forbidden = {"nvngx_dlssnr.dll", "_nvngx.dll"}
-        found = [p for p in ROOT.rglob("*") if p.is_file() and p.name.lower() in forbidden]
-        self.assertEqual(found, [])
+    def test_runtime_binary_is_not_committable(self):
+        # A proprietary DLL in an ignored path such as runtime/ is the
+        # documented local setup. What must never happen is one becoming part
+        # of a commit, which is what the checker enforces.
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "check_no_proprietary_binaries.py")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_exact_blender_revision_is_pinned(self):
         expected = "a3db93c5b2595a79f65f304114c23aeef8c2139f"

@@ -54,6 +54,24 @@ Windows RTX smoke test:
 5. Remove runtime path and confirm Blender reports error without terminating.
 6. Retest OptiX and OpenImageDenoise.
 
+## Confirmed runtime behaviour
+
+Measured against `nvngx_dlssnr.dll` 310.8.0 on an RTX 5050 (Blackwell), driver 591.86:
+
+```text
+init     SUCCESS
+gpu      NVIDIA GeForce RTX 5050
+abi      Init_Ext order=1 (version, info); param slots uint=3 float=6
+process  SUCCESS
+```
+
+Three things the ABI turned out to require, none of which are guessable from the public headers:
+
+- The snippet must be loaded **by the caller shim**, with `LoadLibraryExW` and `LOAD_WITH_ALTERED_SEARCH_PATH`. Loading it directly from the bridge deadlocks the process on `LoadLibrary`, with every thread parked in a wait state.
+- `Init_Ext` takes the public NGX argument order, `(app, path, device, version, info)`.
+- The capability block's float setter is at vtable slot 6, not slot 1 as the SDK header implies. Slots are probed at runtime.
+- The NGX modules must never be unloaded. `FreeLibrary` on the driver's `_nvngx.dll` deadlocks the same way, so they stay resident for the process lifetime.
+
 ## References
 
 Parameter names, the capability-block calling convention, and the caller-gate approach were recovered by [DaniilSokolyuk/video2dlssnr](https://github.com/DaniilSokolyuk/video2dlssnr). Runtime version pinning and GPU gating follow [Merserk/dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer). Neither project is affiliated with this one.

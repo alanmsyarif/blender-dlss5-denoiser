@@ -10,7 +10,10 @@ if ($Commit -ne $ExpectedCommit) { throw "Expected Blender v5.0.1 commit $Expect
 
 $Status = git -C $Source status --porcelain
 if ($Status) {
-  git -C $Source apply --reverse --check $Patch 2>$null
+  # Not '2>$null': in PowerShell 5.1 redirecting a native command's stderr
+  # raises NativeCommandError, which $ErrorActionPreference='Stop' turns into a
+  # terminating error even when git exits 0.
+  & git -C $Source apply --reverse --check $Patch *>&1 | Out-Null
   if ($LASTEXITCODE -eq 0) {
     Write-Host 'Patch is already applied.'
     exit 0
