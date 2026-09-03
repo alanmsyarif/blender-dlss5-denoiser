@@ -33,7 +33,8 @@ struct NGXHandle { unsigned int Id; };
 // IMPORTANT: only the Get() half of this vtable matches the layout below. The
 // driver core's capability block shuffles its Set() slots: uint is slot 3,
 // resources go through the unsigned-long-long setter at slot 0, and the float
-// setter is NOT at slot 1. Never call Set() directly on the capability block -
+// setter is NOT at slot 1 - MEASURED at slot 6 on driver 591.86, matching what
+// video2dlssnr found on 616.56. Hardcoding the header layout does not work. Never call Set() directly on the capability block -
 // use VSetUInt/VSetFloat/VSetRes, which drive the probed slots. The typed Get()
 // side working is exactly what makes probing possible.
 struct NGXParameter {
@@ -85,10 +86,11 @@ using EvaluateFeatureFn = NGXResult(__cdecl*)(ID3D12GraphicsCommandList*, const 
 using ReleaseFeatureFn = NGXResult(__cdecl*)(NGXHandle*);
 using ShutdownFn = NGXResult(__cdecl*)();
 
-using ShimInitFn = NGXResult(__cdecl*)(void*, unsigned long long, const wchar_t*, ID3D12Device*, int, const void*);
+using ShimInitFn = NGXResult(__cdecl*)(void*, unsigned long long, const wchar_t*, ID3D12Device*, int, const void*, int*, NGXResult*);
 using ShimCreateFn = NGXResult(__cdecl*)(void*, ID3D12GraphicsCommandList*, int, NGXParameter*, NGXHandle**);
 using ShimEvaluateFn = NGXResult(__cdecl*)(void*, ID3D12GraphicsCommandList*, const NGXHandle*, const NGXParameter*, void*);
 using ShimReleaseFn = NGXResult(__cdecl*)(void*, NGXHandle*);
+using ShimLoadSnippetFn = void*(__cdecl*)(const wchar_t*, unsigned long*);
 
 static std::mutex g_mutex;
 static std::string g_last_error;
@@ -116,6 +118,7 @@ static ShimInitFn g_shim_init = nullptr;
 static ShimCreateFn g_shim_create = nullptr;
 static ShimEvaluateFn g_shim_eval = nullptr;
 static ShimReleaseFn g_shim_release = nullptr;
+static ShimLoadSnippetFn g_shim_load_snippet = nullptr;
 
 static ComPtr<ID3D12Device> g_device;
 static ComPtr<ID3D12CommandQueue> g_queue;
@@ -159,6 +162,10 @@ using PfnSetUIntVt = void(__cdecl*)(void*, const char*, unsigned int);
 static constexpr int VT_SET_ULL = 0;
 static int g_uint_slot = 3;
 static int g_float_slot = -1;
+// 0 = not initialized, 1 = version before info pointer, 2 = info pointer
+// before version. Reported in later errors because it identifies which
+// snippet ABI this runtime actually has.
+static int g_init_order = 0;
 
 static void VSetUInt(const char* name, unsigned value) {
     void** vt = *reinterpret_cast<void***>(g_params);
@@ -552,7 +559,9 @@ static bool EnsureFeature(UINT w, UINT h, const LatchedParams& params) {
     else
         r = g_core_create(g_cmd.Get(), NR_FEATURE_ID, g_params, &g_feature);
     if (r != NGX_SUCCESS || !g_feature) {
-        SetError("CreateFeature(18) failed: 0x%08X. Check GPU support, driver, nvngx_dlssnr.dll, and caller shim.", static_cast<unsigned>(r));
+        SetError("CreateFeature(18) failed: 0x%08X. Init_Ext order=%d, param slots uint=%d float=%d. "
+                 "Check GPU support, driver, nvngx_dlssnr.dll, and caller shim.",
+                 static_cast<unsigned>(r), g_init_order, g_uint_slot, g_float_slot);
         return false;
     }
     g_latched = params;
@@ -560,6 +569,10 @@ static bool EnsureFeature(UINT w, UINT h, const LatchedParams& params) {
 }
 
 static bool LoadNGX() {
+    // NGX modules are loaded once and never unloaded, so this is a no-op after
+    // the first successful call.
+    if (g_core_mod && g_nr_mod && g_shim_mod) return true;
+
     g_core_mod = LoadCoreNGX(g_runtime_dir);
     if (!g_core_mod) {
         SetError("Could not load NVIDIA NGX core _nvngx.dll. Tried runtime\\_nvngx.dll, normal DLL search, and NVIDIA DriverStore packages matching nv*.inf_*. You can copy the _nvngx.dll from your active NVIDIA DriverStore folder into runtime\\_nvngx.dll as an explicit override.");
@@ -568,8 +581,6 @@ static bool LoadNGX() {
 
     const std::wstring nr_path = Join(g_runtime_dir, L"nvngx_dlssnr.dll");
     if (!FileExists(nr_path)) { SetError("nvngx_dlssnr.dll not found in runtime folder"); return false; }
-    g_nr_mod = LoadLibraryW(nr_path.c_str());
-    if (!g_nr_mod) { SetError("LoadLibrary(nvngx_dlssnr.dll) failed: Win32 %lu", GetLastError()); return false; }
 
     std::wstring shim_path = Join(Join(g_runtime_dir, L"caller"), L"nvngx.dll_blender.dll");
     if (!FileExists(shim_path)) {
@@ -582,6 +593,14 @@ static bool LoadNGX() {
     if (!FileExists(shim_path)) { SetError("caller shim not found (expected caller\\nvngx.dll_blender.dll)"); return false; }
     g_shim_mod = LoadLibraryW(shim_path.c_str());
     if (!g_shim_mod) { SetError("LoadLibrary(caller shim) failed: Win32 %lu", GetLastError()); return false; }
+
+    // The snippet is loaded BY the shim, so that the module owning the caller's
+    // return address during its initialisation is one the snippet accepts.
+    g_shim_load_snippet = reinterpret_cast<ShimLoadSnippetFn>(GetProcAddress(g_shim_mod, "DLSSNR_LoadSnippet"));
+    if (!g_shim_load_snippet) { SetError("caller shim is missing DLSSNR_LoadSnippet; rebuild it"); return false; }
+    unsigned long snippet_error = 0;
+    g_nr_mod = reinterpret_cast<HMODULE>(g_shim_load_snippet(nr_path.c_str(), &snippet_error));
+    if (!g_nr_mod) { SetError("Loading nvngx_dlssnr.dll via caller shim failed: Win32 %lu", snippet_error); return false; }
 
     g_core_init_ext = reinterpret_cast<InitExtFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_Init_Ext"));
     g_core_init_project = reinterpret_cast<InitProjectIdFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_Init_ProjectID"));
@@ -636,13 +655,20 @@ static bool InitNGXSession() {
     }
     if (!core_ok) { SetError("NGX core initialization failed for API versions 0x13..0x20"); return false; }
 
-    NGXResult sr = g_shim_init(reinterpret_cast<void*>(g_nr_init), APP_ID, g_runtime_dir.c_str(), g_device.Get(), 0x15, &fci);
+    NGXResult first_order_result = 0;
+    g_init_order = 0;
+    NGXResult sr = g_shim_init(reinterpret_cast<void*>(g_nr_init), APP_ID, g_runtime_dir.c_str(),
+                               g_device.Get(), 0x15, &fci, &g_init_order, &first_order_result);
     if (sr != NGX_SUCCESS) {
         wchar_t shim_self[MAX_PATH] = L"<unknown>";
         GetModuleFileNameW(g_shim_mod, shim_self, MAX_PATH);
         char shim_utf8[MAX_PATH * 3] = {};
         WideCharToMultiByte(CP_UTF8, 0, shim_self, -1, shim_utf8, static_cast<int>(sizeof(shim_utf8)), nullptr, nullptr);
-        SetError("DLSSNR snippet Init_Ext via caller shim failed: 0x%08X; loaded shim=%s", static_cast<unsigned>(sr), shim_utf8);
+        // 0xBADC0DE0 is the shim's marker for an attempt that faulted rather
+        // than being rejected, which is itself evidence about the argument order.
+        SetError("DLSSNR snippet Init_Ext via caller shim failed. Order 1 (version, info): 0x%08X. "
+                 "Order 2 (info, version): 0x%08X. Loaded shim=%s",
+                 static_cast<unsigned>(first_order_result), static_cast<unsigned>(sr), shim_utf8);
         return false;
     }
 
@@ -669,29 +695,13 @@ static void ShutdownUnlocked() {
     if (g_core_shutdown) g_core_shutdown();
     g_params = nullptr;
     g_device.Reset(); g_queue.Reset(); g_cmd_alloc.Reset(); g_cmd.Reset(); g_fence.Reset();
-    if (g_shim_mod) FreeLibrary(g_shim_mod);
-    if (g_nr_mod) FreeLibrary(g_nr_mod);
-    if (g_core_mod) FreeLibrary(g_core_mod);
-    g_shim_mod = g_nr_mod = g_core_mod = nullptr;
 
-    g_core_init_ext = nullptr;
-    g_core_init_project = nullptr;
-    g_alloc_params = nullptr;
-    g_get_caps_params = nullptr;
-    g_float_slot = -1;
-    g_uint_slot = 3;
-    g_core_create = nullptr;
-    g_core_eval = nullptr;
-    g_core_release = nullptr;
-    g_core_shutdown = nullptr;
-    g_nr_init = nullptr;
-    g_nr_create = nullptr;
-    g_nr_eval = nullptr;
-    g_nr_release = nullptr;
-    g_shim_init = nullptr;
-    g_shim_create = nullptr;
-    g_shim_eval = nullptr;
-    g_shim_release = nullptr;
+    // The NGX modules are deliberately left mapped. FreeLibrary on the driver's
+    // _nvngx.dll deadlocks: it owns worker threads and the unload never
+    // completes, leaving every thread parked in a wait state. Keeping them
+    // resident for the process lifetime is how NGX is meant to be used, and it
+    // makes a later re-init cheap. Function pointers stay valid with them.
+
 
     g_initialized = false;
 }
@@ -699,7 +709,15 @@ static void ShutdownUnlocked() {
 extern "C" {
 
 __declspec(dllexport) const char* __cdecl dlss5nr_version() {
-    return "0.3.0-capability-params-probed-slots";
+    return "0.4.0-shim-loaded-snippet";
+}
+
+// What the runtime actually turned out to want, filled in during init. This is
+// the answer to the ABI questions the project could only guess at before.
+static std::string g_abi_info = "not initialized";
+
+__declspec(dllexport) const char* __cdecl dlss5nr_abi_info() {
+    return g_abi_info.c_str();
 }
 
 __declspec(dllexport) const char* __cdecl dlss5nr_gpu_name() {
@@ -723,6 +741,11 @@ __declspec(dllexport) int __cdecl dlss5nr_init(int gpu_index, const wchar_t* run
         return 0;
     }
     g_initialized = true;
+    char abi[256];
+    snprintf(abi, sizeof(abi),
+             "Init_Ext order=%d (1=version,info 2=info,version); param slots uint=%d float=%d",
+             g_init_order, g_uint_slot, g_float_slot);
+    g_abi_info = abi;
     CopyError(err, err_cap);
     return 1;
 }
