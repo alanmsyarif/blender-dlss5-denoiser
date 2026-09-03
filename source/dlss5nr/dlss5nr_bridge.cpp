@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +29,13 @@ static constexpr const char* PROJECT_ID = "53f803cc-a12f-4d69-90d5-19b7599cad19"
 struct NGXHandle { unsigned int Id; };
 
 // Minimal ABI-compatible interface used by the NVIDIA NGX parameter object.
+//
+// IMPORTANT: only the Get() half of this vtable matches the layout below. The
+// driver core's capability block shuffles its Set() slots: uint is slot 3,
+// resources go through the unsigned-long-long setter at slot 0, and the float
+// setter is NOT at slot 1. Never call Set() directly on the capability block -
+// use VSetUInt/VSetFloat/VSetRes, which drive the probed slots. The typed Get()
+// side working is exactly what makes probing possible.
 struct NGXParameter {
     virtual void Set(const char*, unsigned long long) = 0;
     virtual void Set(const char*, float) = 0;
@@ -71,6 +79,7 @@ using InitExtFn = NGXResult(__cdecl*)(unsigned long long, const wchar_t*, ID3D12
 using SnippetInitFn = NGXResult(__cdecl*)(unsigned long long, const wchar_t*, ID3D12Device*, const void*, int);
 using InitProjectIdFn = NGXResult(__cdecl*)(const char*, int, const char*, const wchar_t*, ID3D12Device*, int, const void*);
 using AllocParamsFn = NGXResult(__cdecl*)(NGXParameter**);
+using GetCapsParamsFn = NGXResult(__cdecl*)(NGXParameter**);
 using CreateFeatureFn = NGXResult(__cdecl*)(ID3D12GraphicsCommandList*, int, NGXParameter*, NGXHandle**);
 using EvaluateFeatureFn = NGXResult(__cdecl*)(ID3D12GraphicsCommandList*, const NGXHandle*, const NGXParameter*, void*);
 using ReleaseFeatureFn = NGXResult(__cdecl*)(NGXHandle*);
@@ -94,6 +103,7 @@ static HMODULE g_shim_mod = nullptr;
 static InitExtFn g_core_init_ext = nullptr;
 static InitProjectIdFn g_core_init_project = nullptr;
 static AllocParamsFn g_alloc_params = nullptr;
+static GetCapsParamsFn g_get_caps_params = nullptr;
 static CreateFeatureFn g_core_create = nullptr;
 static EvaluateFeatureFn g_core_eval = nullptr;
 static ReleaseFeatureFn g_core_release = nullptr;
@@ -118,12 +128,93 @@ static NGXParameter* g_params = nullptr;
 static NGXHandle* g_feature = nullptr;
 static ComPtr<ID3D12Resource> g_color;
 static ComPtr<ID3D12Resource> g_output;
+static ComPtr<ID3D12Resource> g_depth;
+static ComPtr<ID3D12Resource> g_motion;
 static ComPtr<ID3D12Resource> g_upload;
 static ComPtr<ID3D12Resource> g_readback;
 static UINT g_width = 0, g_height = 0, g_row_pitch = 0;
 static UINT64 g_total_bytes = 0;
-static int g_feature_style = -999;
-static int g_feature_preset = -999;
+// Every parameter the model latches at CreateFeature. Changing any of them has
+// no effect until the feature is rebuilt, so all of them are tracked.
+struct LatchedParams {
+    int style = -999;
+    int preset = -999;
+    float intensity = -999.0f;
+    float tone = -999.0f;
+    float structure = -999.0f;
+    float skin = -999.0f;
+    int automask = -999;
+    bool operator==(const LatchedParams& o) const {
+        return style == o.style && preset == o.preset && intensity == o.intensity &&
+               tone == o.tone && structure == o.structure && skin == o.skin &&
+               automask == o.automask;
+    }
+};
+static LatchedParams g_latched;
+
+// Raw-vtable setters for the capability block. See the note on NGXParameter.
+using PfnSetULLVt = void(__cdecl*)(void*, const char*, unsigned long long);
+using PfnSetFloatVt = void(__cdecl*)(void*, const char*, float);
+using PfnSetUIntVt = void(__cdecl*)(void*, const char*, unsigned int);
+static constexpr int VT_SET_ULL = 0;
+static int g_uint_slot = 3;
+static int g_float_slot = -1;
+
+static void VSetUInt(const char* name, unsigned value) {
+    void** vt = *reinterpret_cast<void***>(g_params);
+    reinterpret_cast<PfnSetUIntVt>(vt[g_uint_slot])(g_params, name, value);
+}
+
+static void VSetFloat(const char* name, float value) {
+    void** vt = *reinterpret_cast<void***>(g_params);
+    reinterpret_cast<PfnSetFloatVt>(vt[g_float_slot < 0 ? 1 : g_float_slot])(g_params, name, value);
+}
+
+static void VSetRes(const char* name, ID3D12Resource* res) {
+    void** vt = *reinterpret_cast<void***>(g_params);
+    reinterpret_cast<PfnSetULLVt>(vt[VT_SET_ULL])(g_params, name, reinterpret_cast<unsigned long long>(res));
+}
+
+// Find which Set() slot actually stores a uint / a float by round-tripping a
+// value through the typed Get(). Every slot in 0..7 is a Set overload, so an
+// x64 call with (this, name, value) is ABI-safe whichever one is hit; only the
+// interpretation of the value register differs.
+static void DiscoverSetterSlots() {
+    void** vt = *reinterpret_cast<void***>(g_params);
+    for (int slot = 0; slot < 8; ++slot) {
+        const unsigned probe = 0x1234u;
+        unsigned readback = 0;
+        reinterpret_cast<PfnSetUIntVt>(vt[slot])(g_params, "DLSSNR.UProbe", probe);
+        if (g_params->Get("DLSSNR.UProbe", &readback) == NGX_SUCCESS && readback == probe) {
+            g_uint_slot = slot;
+            break;
+        }
+    }
+    for (int slot = 0; slot < 8; ++slot) {
+        const float probe = 0.3125f;  // exact in binary
+        float readback = 0.0f;
+        reinterpret_cast<PfnSetFloatVt>(vt[slot])(g_params, "DLSSNR.Probe", probe);
+        if (g_params->Get("DLSSNR.Probe", &readback) == NGX_SUCCESS && readback == probe) {
+            g_float_slot = slot;
+            break;
+        }
+    }
+    if (g_float_slot < 0) g_float_slot = 1;
+}
+
+// The model is trained on display-referred images. Cycles and the Blender
+// Render Result hand us linear scene-referred colour, so encode on the way in
+// and decode on the way out.
+static float LinearToSrgb(float c) {
+    if (c <= 0.0f) return 0.0f;
+    if (c <= 0.0031308f) return c * 12.92f;
+    return 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
+}
+
+static float SrgbToLinear(float c) {
+    if (c <= 0.04045f) return c / 12.92f;
+    return powf((c + 0.055f) / 1.055f, 2.4f);
+}
 
 static void SetError(const char* fmt, ...) {
     char buf[4096];
@@ -296,11 +387,12 @@ static D3D12_RESOURCE_BARRIER Barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES b
     return b;
 }
 
-static ComPtr<ID3D12Resource> CreateTexture(UINT w, UINT h, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags) {
+static ComPtr<ID3D12Resource> CreateTexture(UINT w, UINT h, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags,
+                                            DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT) {
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     d.Width = w; d.Height = h; d.DepthOrArraySize = 1; d.MipLevels = 1;
-    d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    d.Format = format;
     d.SampleDesc.Count = 1;
     d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     d.Flags = flags;
@@ -362,15 +454,23 @@ static void ReleaseFeatureAndResources() {
         g_feature = nullptr;
     }
     g_color.Reset(); g_output.Reset(); g_upload.Reset(); g_readback.Reset();
+    g_depth.Reset(); g_motion.Reset();
     g_width = g_height = g_row_pitch = 0;
     g_total_bytes = 0;
-    g_feature_style = -999; g_feature_preset = -999;
+    g_latched = LatchedParams{};
 }
 
 static bool AllocateFrameResources(UINT w, UINT h) {
     g_color = CreateTexture(w, h, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     g_output = CreateTexture(w, h, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     if (!g_color || !g_output) { SetError("Failed to create RGBA16F D3D12 textures"); return false; }
+
+    // Feature 18 wants Depth and MVec bound even when there is nothing to put
+    // in them. Cycles guides are not wired up yet, so these stay cleared - the
+    // model then behaves as a single-frame spatial denoiser.
+    g_depth = CreateTexture(w, h, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, DXGI_FORMAT_R32_FLOAT);
+    g_motion = CreateTexture(w, h, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, DXGI_FORMAT_R16G16_FLOAT);
+    if (!g_depth || !g_motion) { SetError("Failed to create D3D12 depth/motion guide textures"); return false; }
 
     g_row_pitch = (w * 8u + 255u) & ~255u;
     g_total_bytes = static_cast<UINT64>(g_row_pitch) * h;
@@ -381,46 +481,70 @@ static bool AllocateFrameResources(UINT w, UINT h) {
     return true;
 }
 
-static void SetCommonParams(int style, int preset, float intensity, float tone, float structure, float skin, int automask, int reset) {
-    g_params->Set("DLSSNR.Width", g_width);
-    g_params->Set("DLSSNR.Height", g_height);
-    g_params->Set("DLSSNR.Enabled", 1);
-    g_params->Set("DLSSNR.Reset", reset);
-    g_params->Set("DLSSNR.Style", style);
-    g_params->Set("DLSSNR.Hint.Render.Preset", preset);
-    g_params->Set("DLSSNR.Intensity", intensity);
-    g_params->Set("DLSSNR.LocalToneStrength", tone);
-    g_params->Set("DLSSNR.LocalStructureStrength", structure);
-    g_params->Set("DLSSNR.SkinStructureStrength", skin);
-    g_params->Set("DLSSNR.UseAutoMask", automask);
-    g_params->Set("DLSSNR.UICorrection", 0);
-    g_params->Set("DLSSNR.DepthInverted", 1);
-    g_params->Set("DLSSNR.ScalingRatio", 1.0f);
-    g_params->Set("DLSSNR.MVecScaleX", 1.0f);
-    g_params->Set("DLSSNR.MVecScaleY", 1.0f);
-    g_params->Set("DLSSNR.Color", g_color.Get());
-    g_params->Set("DLSSNR.Output", g_output.Get());
-    g_params->Set("DLSSNR.Backbuffer", g_output.Get());
-    g_params->Set("DLSSNR.ColorSubrectBaseX", 0);
-    g_params->Set("DLSSNR.ColorSubrectBaseY", 0);
-    g_params->Set("DLSSNR.ColorSubrectWidth", g_width);
-    g_params->Set("DLSSNR.ColorSubrectHeight", g_height);
-    g_params->Set("DLSSNR.OutputSubrectBaseX", 0);
-    g_params->Set("DLSSNR.OutputSubrectBaseY", 0);
-    g_params->Set("DLSSNR.OutputSubrectWidth", g_width);
-    g_params->Set("DLSSNR.OutputSubrectHeight", g_height);
+// Everything the model latches. Written once, at CreateFeature - the DLL
+// ignores these when they are written only at evaluate time.
+static void SetCreateParams(const LatchedParams& p) {
+    VSetUInt("CreationNodeMask", 1);
+    VSetUInt("VisibilityNodeMask", 1);
+    // Both the generic and the DLSSNR-prefixed size keys: the DLL reads one
+    // pair and which one is not documented.
+    VSetUInt("Width", g_width);
+    VSetUInt("Height", g_height);
+    VSetUInt("OutWidth", g_width);
+    VSetUInt("OutHeight", g_height);
+    VSetUInt("PerfQualityValue", 2);
+    VSetUInt("DLSSNR.Enabled", 1);
+    VSetUInt("DLSSNR.Width", g_width);
+    VSetUInt("DLSSNR.Height", g_height);
+    VSetUInt("DLSSNR.InputWidth", g_width);
+    VSetUInt("DLSSNR.InputHeight", g_height);
+    VSetUInt("DLSSNR.OutputWidth", g_width);
+    VSetUInt("DLSSNR.OutputHeight", g_height);
+    VSetUInt("DLSSNR.Upscaling", 0);
+    VSetUInt("DLSSNR.Style", static_cast<unsigned>(p.style));
+    VSetUInt("DLSSNR.Hint.Render.Preset", static_cast<unsigned>(p.preset));
+    VSetFloat("DLSSNR.Intensity", p.intensity);
+    VSetFloat("DLSSNR.LocalToneStrength", p.tone);
+    VSetFloat("DLSSNR.LocalStructureStrength", p.structure);
+    // Negative means "leave the model default alone".
+    if (p.skin >= 0.0f) VSetFloat("DLSSNR.SkinStructureStrength", p.skin);
+    VSetUInt("DLSSNR.UseAutoMask", static_cast<unsigned>(p.automask));
+    VSetUInt("DLSSNR.UICorrection", 0);
 }
 
-static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity, float tone, float structure, float skin, int automask) {
-    const bool rebuild = !g_feature || w != g_width || h != g_height || style != g_feature_style || preset != g_feature_preset;
-    if (!rebuild) {
-        SetCommonParams(style, preset, intensity, tone, structure, skin, automask, 0);
-        return true;
-    }
+// Per-evaluate state: the resources and the frame-to-frame bookkeeping.
+static void SetEvalParams(int reset) {
+    VSetRes("DLSSNR.Color", g_color.Get());
+    VSetRes("DLSSNR.Depth", g_depth.Get());
+    VSetRes("DLSSNR.MVec", g_motion.Get());
+    VSetRes("DLSSNR.Output", g_output.Get());
+    VSetUInt("DLSSNR.Enabled", 1);
+    VSetUInt("DLSSNR.Width", g_width);
+    VSetUInt("DLSSNR.Height", g_height);
+    VSetUInt("DLSSNR.Reset", static_cast<unsigned>(reset));
+    VSetUInt("DLSSNR.DepthInverted", 0);
+    VSetUInt("DLSSNR.ColorSubrectBaseX", 0);
+    VSetUInt("DLSSNR.ColorSubrectBaseY", 0);
+    VSetUInt("DLSSNR.ColorSubrectWidth", g_width);
+    VSetUInt("DLSSNR.ColorSubrectHeight", g_height);
+    VSetUInt("DLSSNR.DepthSubrectWidth", g_width);
+    VSetUInt("DLSSNR.DepthSubrectHeight", g_height);
+    VSetUInt("DLSSNR.MVecSubrectWidth", g_width);
+    VSetUInt("DLSSNR.MVecSubrectHeight", g_height);
+    VSetUInt("DLSSNR.OutputSubrectBaseX", 0);
+    VSetUInt("DLSSNR.OutputSubrectBaseY", 0);
+    VSetUInt("DLSSNR.OutputSubrectWidth", g_width);
+    VSetUInt("DLSSNR.OutputSubrectHeight", g_height);
+    VSetFloat("DLSSNR.MVecScaleX", 1.0f);
+    VSetFloat("DLSSNR.MVecScaleY", 1.0f);
+}
+
+static bool EnsureFeature(UINT w, UINT h, const LatchedParams& params) {
+    if (g_feature && w == g_width && h == g_height && params == g_latched) return true;
 
     ReleaseFeatureAndResources();
     if (!AllocateFrameResources(w, h)) return false;
-    SetCommonParams(style, preset, intensity, tone, structure, skin, automask, 1);
+    SetCreateParams(params);
 
     NGXResult r;
     if (g_nr_create && g_shim_create)
@@ -431,8 +555,7 @@ static bool EnsureFeature(UINT w, UINT h, int style, int preset, float intensity
         SetError("CreateFeature(18) failed: 0x%08X. Check GPU support, driver, nvngx_dlssnr.dll, and caller shim.", static_cast<unsigned>(r));
         return false;
     }
-    g_feature_style = style;
-    g_feature_preset = preset;
+    g_latched = params;
     return true;
 }
 
@@ -463,6 +586,7 @@ static bool LoadNGX() {
     g_core_init_ext = reinterpret_cast<InitExtFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_Init_Ext"));
     g_core_init_project = reinterpret_cast<InitProjectIdFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_Init_ProjectID"));
     g_alloc_params = reinterpret_cast<AllocParamsFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_AllocateParameters"));
+    g_get_caps_params = reinterpret_cast<GetCapsParamsFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_GetCapabilityParameters"));
     g_core_create = reinterpret_cast<CreateFeatureFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_CreateFeature"));
     g_core_eval = reinterpret_cast<EvaluateFeatureFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_EvaluateFeature"));
     g_core_release = reinterpret_cast<ReleaseFeatureFn>(GetProcAddress(g_core_mod, "NVSDK_NGX_D3D12_ReleaseFeature"));
@@ -478,7 +602,7 @@ static bool LoadNGX() {
     g_shim_eval = reinterpret_cast<ShimEvaluateFn>(GetProcAddress(g_shim_mod, "DLSSNR_CallEvaluate"));
     g_shim_release = reinterpret_cast<ShimReleaseFn>(GetProcAddress(g_shim_mod, "DLSSNR_CallRelease"));
 
-    if (!g_core_init_ext || !g_alloc_params || !g_core_create || !g_core_eval || !g_core_release || !g_core_shutdown) {
+    if (!g_core_init_ext || (!g_get_caps_params && !g_alloc_params) || !g_core_create || !g_core_eval || !g_core_release || !g_core_shutdown) {
         SetError("Required NGX core exports are missing"); return false;
     }
     if (!g_nr_init || !g_nr_create || !g_nr_eval || !g_nr_release) {
@@ -522,11 +646,21 @@ static bool InitNGXSession() {
         return false;
     }
 
-    NGXResult ar = g_alloc_params(&g_params);
+    // Feature 18 must be created on the CORE's capability parameters. A freshly
+    // allocated block carries none of the snippet/preset callbacks CreateFeature
+    // needs, and answers UnableToInitializeFeature (0xBAD0000B).
+    g_params = nullptr;
+    NGXResult ar = 0;
+    if (g_get_caps_params) ar = g_get_caps_params(&g_params);
+    if ((ar != NGX_SUCCESS || !g_params) && g_alloc_params) {
+        g_params = nullptr;
+        ar = g_alloc_params(&g_params);
+    }
     if (ar != NGX_SUCCESS || !g_params) {
-        SetError("NVSDK_NGX_D3D12_AllocateParameters failed: 0x%08X", static_cast<unsigned>(ar));
+        SetError("NGX parameter block unavailable (GetCapabilityParameters/AllocateParameters): 0x%08X", static_cast<unsigned>(ar));
         return false;
     }
+    DiscoverSetterSlots();
     return true;
 }
 
@@ -543,6 +677,9 @@ static void ShutdownUnlocked() {
     g_core_init_ext = nullptr;
     g_core_init_project = nullptr;
     g_alloc_params = nullptr;
+    g_get_caps_params = nullptr;
+    g_float_slot = -1;
+    g_uint_slot = 3;
     g_core_create = nullptr;
     g_core_eval = nullptr;
     g_core_release = nullptr;
@@ -562,7 +699,7 @@ static void ShutdownUnlocked() {
 extern "C" {
 
 __declspec(dllexport) const char* __cdecl dlss5nr_version() {
-    return "0.2.0-cpu-staging-raw-channels";
+    return "0.3.0-capability-params-probed-slots";
 }
 
 __declspec(dllexport) const char* __cdecl dlss5nr_gpu_name() {
@@ -601,10 +738,21 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     if (!rgb_in || !rgb_out || width <= 0 || height <= 0) { SetError("Invalid image buffer/dimensions"); CopyError(err, err_cap); return 0; }
     if (width > 16384 || height > 16384) { SetError("Image dimensions are unreasonably large"); CopyError(err, err_cap); return 0; }
 
-    if (!EnsureFeature(static_cast<UINT>(width), static_cast<UINT>(height), style, preset, intensity, tone, structure, skin, automask)) {
+    LatchedParams params;
+    params.style = style;
+    params.preset = preset;
+    params.intensity = intensity;
+    params.tone = tone;
+    params.structure = structure;
+    params.skin = skin;
+    params.automask = automask;
+
+    const bool rebuilt = !g_feature || static_cast<UINT>(width) != g_width ||
+                         static_cast<UINT>(height) != g_height || !(params == g_latched);
+    if (!EnsureFeature(static_cast<UINT>(width), static_cast<UINT>(height), params)) {
         CopyError(err, err_cap); return 0;
     }
-    SetCommonParams(style, preset, intensity, tone, structure, skin, automask, reset ? 1 : 0);
+    SetEvalParams((reset || rebuilt) ? 1 : 0);
 
     void* mapped = nullptr;
     HRESULT hr = g_upload->Map(0, nullptr, &mapped);
@@ -615,9 +763,10 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
         auto* row = reinterpret_cast<uint16_t*>(dst_base + static_cast<size_t>(y) * g_row_pitch);
         const float* src = rgb_in + static_cast<size_t>(y) * width * 3;
         for (int x = 0; x < width; ++x) {
-            row[x * 4 + 0] = FloatToHalf(std::clamp(src[x * 3 + 0], 0.0f, 1.0f));
-            row[x * 4 + 1] = FloatToHalf(std::clamp(src[x * 3 + 1], 0.0f, 1.0f));
-            row[x * 4 + 2] = FloatToHalf(std::clamp(src[x * 3 + 2], 0.0f, 1.0f));
+            // The model expects display-referred colour; Cycles hands us linear.
+            row[x * 4 + 0] = FloatToHalf(LinearToSrgb(std::clamp(src[x * 3 + 0], 0.0f, 1.0f)));
+            row[x * 4 + 1] = FloatToHalf(LinearToSrgb(std::clamp(src[x * 3 + 1], 0.0f, 1.0f)));
+            row[x * 4 + 2] = FloatToHalf(LinearToSrgb(std::clamp(src[x * 3 + 2], 0.0f, 1.0f)));
             row[x * 4 + 3] = FloatToHalf(1.0f);
         }
     }
@@ -671,9 +820,9 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
             // DLSSNR builds have been observed to produce B,G,R,A while patched
             // Ada builds may produce R,G,B,A. Python selects/auto-detects the
             // correct interpretation instead of hard-coding a swap here.
-            dstf[x * 3 + 0] = std::clamp(HalfToFloat(row[x * 4 + 0]), 0.0f, 1.0f);
-            dstf[x * 3 + 1] = std::clamp(HalfToFloat(row[x * 4 + 1]), 0.0f, 1.0f);
-            dstf[x * 3 + 2] = std::clamp(HalfToFloat(row[x * 4 + 2]), 0.0f, 1.0f);
+            dstf[x * 3 + 0] = SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 0]), 0.0f, 1.0f));
+            dstf[x * 3 + 1] = SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 1]), 0.0f, 1.0f));
+            dstf[x * 3 + 2] = SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 2]), 0.0f, 1.0f));
         }
     }
     g_readback->Unmap(0, nullptr);

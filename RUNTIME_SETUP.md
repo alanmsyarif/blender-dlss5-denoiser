@@ -2,6 +2,8 @@
 
 Obtain compatible NVIDIA runtime files through a license that permits your use. This project does not provide, download, or redistribute them.
 
+The tested `nvngx_dlssnr.dll` is version `310.8.0.0`, FileVersion `310.8.SF.0`, product name `NVIDIA DLSSNR`. Check those fields before use. Other versions may move the parameter-block ABI the bridge probes at startup.
+
 Create this layout outside the repository or inside an unpacked local build:
 
 ```text
