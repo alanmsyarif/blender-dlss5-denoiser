@@ -16,7 +16,7 @@ BRIDGE = ROOT / "source/dlss5nr/dlss5nr_bridge.cpp"
 # Mirror the bridge's constants: the knee below which colour passes through
 # untouched, and the largest value FP16 holds below 1.0.
 CEILING = 1.0 - 1.0 / 2048.0
-KNEE_START = 0.8
+KNEE_START = 0.0
 KNEE_SCALE = 1.0
 
 
@@ -57,9 +57,12 @@ class TonemapMathTests(unittest.TestCase):
     def test_below_the_knee_is_exact(self):
         # The point of the knee: the range most pixels live in is not resampled
         # at all, so it costs no precision to carry highlights.
-        for value in (0.0, 0.1, 0.5, 0.79, KNEE_START):
-            self.assertAlmostEqual(forward(value), value, places=6)
-            self.assertAlmostEqual(inverse(forward(value)), value, places=6)
+        # With no knee this degenerates to the round trip test above; the knee
+        # is kept as a constant because a future staging change may want one,
+        # but 0.8 measurably destroyed model output and is not coming back
+        # without numbers behind it.
+        for value in (0.0, 0.1, 0.5, 0.79, 1.0, 25.0):
+            self.assertAlmostEqual(inverse(forward(value)), value, places=3)
 
     def test_forward_is_monotonic(self):
         values = [forward(v) for v in (0.0, 0.1, 1.0, 10.0, 100.0)]
@@ -96,7 +99,7 @@ class BridgeStagingTests(unittest.TestCase):
 
     def test_constants_match_the_python_mirror(self):
         self.assertIn("1.0f - 1.0f / 2048.0f", self.source)
-        self.assertIn("kKneeStart = 0.8f", self.source)
+        self.assertIn("kKneeStart = 0.0f", self.source)
         self.assertIn("kKneeScale = 1.0f", self.source)
 
 

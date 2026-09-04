@@ -247,7 +247,17 @@ static float SrgbToLinear(float c) {
 // Everything below the knee passes through untouched, so the range a render
 // actually spends most of its pixels in keeps full precision, and only the
 // excess above it is compressed into what is left of [0, 1).
-static constexpr float kKneeStart = 0.8f;
+// No knee. Plain Reinhard, which is what this was before a knee at 0.8 was added
+// on a single run comparison that sat inside the noise band.
+//
+// The knee created a cliff exactly where the model works. A highlight of 1.717
+// tonemaps to 0.896, encodes to 0.952, and comes back as 0.903; that decodes to
+// 0.783, which falls below a 0.8 knee and so receives no expansion at all,
+// landing at 0.783 instead of about 1.6. A 5% change by the model became a 54%
+// loss. Measured against a 512 sample reference on a character render, at 16
+// samples: knee 0.8 gave 34.92% RMSE keeping 51% of reference highlights, knee
+// 0.5 gave 25.79% and 73%, and no knee gives 25.13% and 85%.
+static constexpr float kKneeStart = 0.0f;
 static constexpr float kKneeScale = 1.0f;
 
 // Colour reaches the model sRGB encoded. Feeding it linear instead was tried on
