@@ -11,6 +11,15 @@ param(
   # them, -GpuOff still produces a Blender that exercises the DLSS 5 NR
   # translation unit and all of its enum plumbing.
   [switch]$GpuOff,
+  # Path to the OptiX SDK root, the directory holding 'include/optix.h'. Cycles
+  # asks for OptiX 8.0.0 and FindOptiX only requires the include directory, so
+  # the headers alone are enough: there is no OptiX library to link.
+  [string]$OptixRoot,
+  # Architectures to compile Cycles GPU kernels for, e.g. 'sm_120' for
+  # Blackwell. Needs the CUDA Toolkit on PATH for nvcc. Leaving this unset
+  # builds an OptiX-capable Blender with no precompiled kernels, which is
+  # enough to enumerate the device but not to render on it.
+  [string]$CudaArch,
   [switch]$ConfigureOnly
 )
 
@@ -63,6 +72,27 @@ $cmakeArgs = @(
 # 32 KB command line limit. Until this is resolved, link blender.exe by hand
 # with a response file rewritten one argument per line, then embed the manifest
 # with mt.exe. See scripts/link_blender_workaround.ps1.
+
+if ($OptixRoot) {
+  if (!(Test-Path (Join-Path $OptixRoot 'include\optix.h'))) {
+    throw "No include\optix.h under $OptixRoot. Point -OptixRoot at the SDK root."
+  }
+  $cmakeArgs += @(
+    '-DWITH_CYCLES_DEVICE_OPTIX=ON',
+    '-DWITH_CYCLES_DEVICE_CUDA=ON',
+    "-DOPTIX_ROOT_DIR=$OptixRoot"
+  )
+  if ($CudaArch) {
+    # Blender defaults to ten architectures, each a full megakernel nvcc run.
+    # Building only the one this machine uses turns hours into minutes. Note
+    # CUDA 13 dropped Maxwell and Pascal, so the default list fails outright
+    # there; naming an architecture avoids that too.
+    $cmakeArgs += @(
+      '-DWITH_CYCLES_CUDA_BINARIES=ON',
+      "-DCYCLES_CUDA_BINARIES_ARCH=$CudaArch"
+    )
+  }
+}
 
 if ($GpuOff) {
   $cmakeArgs += @(
