@@ -19,7 +19,15 @@ New-Item -ItemType Directory -Force $Runtime | Out-Null
 Copy-Item (Join-Path $Adapter 'nvngx.dll_comfy.dll') $Runtime
 Copy-Item (Join-Path $Root 'RUNTIME_SETUP.md') $Stage
 
-$Forbidden = Get-ChildItem $Stage -Recurse -File | Where-Object { $_.Name -in @('nvngx_dlssnr.dll', '_nvngx.dll') }
+# Matching on filename alone missed a renamed copy, and this archive is meant
+# to be handed to other people, so a miss here redistributes NVIDIA's runtime
+# rather than merely committing it. ProductName is checked too: RUNTIME_SETUP.md
+# pins the tested nvngx_dlssnr.dll as product name 'NVIDIA DLSSNR', which no
+# file we ship carries. _nvngx.dll is the driver's own loader with a different
+# product name, so the name list stays as well.
+$Forbidden = Get-ChildItem $Stage -Recurse -File | Where-Object {
+  $_.Name -in @('nvngx_dlssnr.dll', '_nvngx.dll') -or $_.VersionInfo.ProductName -eq 'NVIDIA DLSSNR'
+}
 if ($Forbidden) { throw 'Refusing to package proprietary NVIDIA runtime DLLs.' }
 New-Item -ItemType Directory -Force $Dist | Out-Null
 Remove-Item $Archive -Force -ErrorAction SilentlyContinue
