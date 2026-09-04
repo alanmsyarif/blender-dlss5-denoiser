@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 19eae0d..95f6017 100644
+index 19eae0de..95f60174 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -632,6 +632,10 @@ option(WITH_CYCLES_OSL "Build Cycles with OpenShadingLanguage support" ON)
@@ -14,7 +14,7 @@ index 19eae0d..95f6017 100644
  option(WITH_CYCLES_STANDALONE "Build Cycles standalone application" OFF)
  option(WITH_CYCLES_STANDALONE_GUI "Build Cycles standalone with GUI" OFF)
 diff --git a/intern/cycles/CMakeLists.txt b/intern/cycles/CMakeLists.txt
-index e7b7709..e253e33 100644
+index e7b77090..e253e335 100644
 --- a/intern/cycles/CMakeLists.txt
 +++ b/intern/cycles/CMakeLists.txt
 @@ -216,6 +216,9 @@ include_directories(
@@ -28,7 +28,7 @@ index e7b7709..e253e33 100644
    add_definitions(-DWITH_CYCLES_STANDALONE_GUI)
  endif()
 diff --git a/intern/cycles/blender/addon/properties.py b/intern/cycles/blender/addon/properties.py
-index a37d057..c7def35 100644
+index a37d057a..c7def353 100644
 --- a/intern/cycles/blender/addon/properties.py
 +++ b/intern/cycles/blender/addon/properties.py
 @@ -270,6 +270,13 @@ def enum_openimagedenoise_denoiser(self, context):
@@ -62,7 +62,7 @@ index a37d057..c7def35 100644
      items += enum_openimagedenoise_denoiser(self, context)
      return items
 diff --git a/intern/cycles/blender/python.cpp b/intern/cycles/blender/python.cpp
-index 7468bb0..9e4c54c 100644
+index 7468bb03..9e4c54ce 100644
 --- a/intern/cycles/blender/python.cpp
 +++ b/intern/cycles/blender/python.cpp
 @@ -853,6 +853,12 @@ void *CCL_python_module_init()
@@ -79,7 +79,7 @@ index 7468bb0..9e4c54c 100644
      PyModule_AddObjectRef(mod, "with_openimagedenoise", Py_True);
    }
 diff --git a/intern/cycles/device/denoise.cpp b/intern/cycles/device/denoise.cpp
-index 3833a12..852fea1 100644
+index 3833a121..852fea11 100644
 --- a/intern/cycles/device/denoise.cpp
 +++ b/intern/cycles/device/denoise.cpp
 @@ -13,6 +13,8 @@ const char *denoiserTypeToHumanReadable(DenoiserType type)
@@ -100,7 +100,7 @@ index 3833a12..852fea1 100644
  
    return &type_enum;
 diff --git a/intern/cycles/device/denoise.h b/intern/cycles/device/denoise.h
-index e907b8a..742dc4c 100644
+index e907b8af..742dc4cc 100644
 --- a/intern/cycles/device/denoise.h
 +++ b/intern/cycles/device/denoise.h
 @@ -11,6 +11,7 @@ CCL_NAMESPACE_BEGIN
@@ -112,7 +112,7 @@ index e907b8a..742dc4c 100644
  
    DENOISER_NONE = 0,
 diff --git a/intern/cycles/device/optix/device.cpp b/intern/cycles/device/optix/device.cpp
-index 606c203..64abd1d 100644
+index 606c203e..64abd1d7 100644
 --- a/intern/cycles/device/optix/device.cpp
 +++ b/intern/cycles/device/optix/device.cpp
 @@ -83,6 +83,9 @@ void device_optix_info(const vector<DeviceInfo> &cuda_devices, vector<DeviceInfo
@@ -126,7 +126,7 @@ index 606c203..64abd1d 100644
  #    if OIDN_VERSION >= 20300
      if (oidnIsCUDADeviceSupported(info.num)) {
 diff --git a/intern/cycles/integrator/CMakeLists.txt b/intern/cycles/integrator/CMakeLists.txt
-index 4ac700d..a352651 100644
+index 4ac700d7..a352651a 100644
 --- a/intern/cycles/integrator/CMakeLists.txt
 +++ b/intern/cycles/integrator/CMakeLists.txt
 @@ -66,6 +66,11 @@ set(LIB
@@ -142,7 +142,7 @@ index 4ac700d..a352651 100644
    list(APPEND LIB
      ${OPENIMAGEDENOISE_LIBRARIES}
 diff --git a/intern/cycles/integrator/denoiser.cpp b/intern/cycles/integrator/denoiser.cpp
-index b579111..a94a9b2 100644
+index b5791118..a94a9b20 100644
 --- a/intern/cycles/integrator/denoiser.cpp
 +++ b/intern/cycles/integrator/denoiser.cpp
 @@ -7,6 +7,9 @@
@@ -197,10 +197,10 @@ index b579111..a94a9b2 100644
        return make_unique<OptiXDenoiser>(single_denoiser_device, effective_denoiser_params);
 diff --git a/intern/cycles/integrator/denoiser_dlss5nr.cpp b/intern/cycles/integrator/denoiser_dlss5nr.cpp
 new file mode 100644
-index 0000000..7356315
+index 00000000..b66a077f
 --- /dev/null
 +++ b/intern/cycles/integrator/denoiser_dlss5nr.cpp
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,238 @@
 +/* SPDX-FileCopyrightText: 2026 Blender DLSS5 NR contributors
 + *
 + * SPDX-License-Identifier: Apache-2.0 */
@@ -209,6 +209,7 @@ index 0000000..7356315
 +
 +#include <algorithm>
 +#include <cstdlib>
++#include <string>
 +#include <vector>
 +
 +#include "device/device.h"
@@ -254,11 +255,34 @@ index 0000000..7356315
 +    return false;
 +  }
 +
++  /* An explicit path is loaded as given. Without one, fall back to the bridge
++   * sitting next to blender.exe, which is where package_windows.ps1 puts it.
++   * That fallback has to be resolved to an absolute path rather than passed as
++   * the bare name "dlss5nr_bridge.dll": a bare name goes through the default
++   * search order, which includes the process working directory, so anyone able
++   * to write a file there could have Blender load their DLL into its own
++   * process instead of ours. */
 +  const char *bridge_path = std::getenv("CYCLES_DLSS5NR_BRIDGE");
-+  bridge_module_ = LoadLibraryA(bridge_path && bridge_path[0] ? bridge_path :
-+                                                              "dlss5nr_bridge.dll");
++  if (bridge_path && bridge_path[0]) {
++    bridge_module_ = LoadLibraryA(bridge_path);
++  }
++  else {
++    wchar_t executable[MAX_PATH];
++    const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
++    /* A result equal to the buffer size means the path was truncated. */
++    if (length > 0 && length < MAX_PATH) {
++      wchar_t *separator = wcsrchr(executable, L'\\');
++      if (separator) {
++        separator[1] = L'\0';
++        const std::wstring beside_blender = std::wstring(executable) + L"dlss5nr_bridge.dll";
++        bridge_module_ = LoadLibraryW(beside_blender.c_str());
++      }
++    }
++  }
 +  if (!bridge_module_) {
-+    set_error("DLSS 5 NR: dlss5nr_bridge.dll was not found. Set CYCLES_DLSS5NR_BRIDGE.");
++    set_error(
++        "DLSS 5 NR: dlss5nr_bridge.dll was not found next to blender.exe. "
++        "Set CYCLES_DLSS5NR_BRIDGE to its full path.");
 +    failed_ = true;
 +    return false;
 +  }
@@ -417,7 +441,7 @@ index 0000000..7356315
 +CCL_NAMESPACE_END
 diff --git a/intern/cycles/integrator/denoiser_dlss5nr.h b/intern/cycles/integrator/denoiser_dlss5nr.h
 new file mode 100644
-index 0000000..c29a198
+index 00000000..c29a1982
 --- /dev/null
 +++ b/intern/cycles/integrator/denoiser_dlss5nr.h
 @@ -0,0 +1,63 @@
@@ -485,7 +509,7 @@ index 0000000..c29a198
 +
 +CCL_NAMESPACE_END
 diff --git a/intern/cycles/scene/integrator.cpp b/intern/cycles/scene/integrator.cpp
-index eef15d0..ff44895 100644
+index eef15d07..ff448951 100644
 --- a/intern/cycles/scene/integrator.cpp
 +++ b/intern/cycles/scene/integrator.cpp
 @@ -136,6 +136,7 @@ NODE_DEFINE(Integrator)

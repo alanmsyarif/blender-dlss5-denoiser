@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "device/device.h"
@@ -51,11 +52,34 @@ bool DLSS5NRDenoiser::ensure_runtime()
     return false;
   }
 
+  /* An explicit path is loaded as given. Without one, fall back to the bridge
+   * sitting next to blender.exe, which is where package_windows.ps1 puts it.
+   * That fallback has to be resolved to an absolute path rather than passed as
+   * the bare name "dlss5nr_bridge.dll": a bare name goes through the default
+   * search order, which includes the process working directory, so anyone able
+   * to write a file there could have Blender load their DLL into its own
+   * process instead of ours. */
   const char *bridge_path = std::getenv("CYCLES_DLSS5NR_BRIDGE");
-  bridge_module_ = LoadLibraryA(bridge_path && bridge_path[0] ? bridge_path :
-                                                              "dlss5nr_bridge.dll");
+  if (bridge_path && bridge_path[0]) {
+    bridge_module_ = LoadLibraryA(bridge_path);
+  }
+  else {
+    wchar_t executable[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    /* A result equal to the buffer size means the path was truncated. */
+    if (length > 0 && length < MAX_PATH) {
+      wchar_t *separator = wcsrchr(executable, L'\\');
+      if (separator) {
+        separator[1] = L'\0';
+        const std::wstring beside_blender = std::wstring(executable) + L"dlss5nr_bridge.dll";
+        bridge_module_ = LoadLibraryW(beside_blender.c_str());
+      }
+    }
+  }
   if (!bridge_module_) {
-    set_error("DLSS 5 NR: dlss5nr_bridge.dll was not found. Set CYCLES_DLSS5NR_BRIDGE.");
+    set_error(
+        "DLSS 5 NR: dlss5nr_bridge.dll was not found next to blender.exe. "
+        "Set CYCLES_DLSS5NR_BRIDGE to its full path.");
     failed_ = true;
     return false;
   }
