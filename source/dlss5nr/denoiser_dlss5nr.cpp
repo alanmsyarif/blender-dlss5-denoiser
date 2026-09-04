@@ -209,13 +209,20 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
                 output.data(),
                 buffer_params.width,
                 buffer_params.height,
-                0,    /* style: Default */
-                0,    /* preset: Default */
+                params_.dlss5nr_style,
+                /* Preset and intensity are passed at their defaults because
+                 * both measured as exactly no change against the runtime: for
+                 * every value tried the output was bit identical, so either
+                 * those parameter names are wrong or the runtime ignores them.
+                 * There is nothing to expose until that is understood. */
+                0,    /* preset */
                 1.0f, /* intensity */
-                1.0f, /* local tone strength */
-                1.0f, /* local structure strength */
-                -1.0f, /* skin structure: negative leaves the model default */
-                0,    /* auto mask */
+                params_.dlss5nr_tone,
+                params_.dlss5nr_structure,
+                /* Negative leaves the model default alone, and skin only does
+                 * anything when the auto mask is on. */
+                params_.dlss5nr_skin,
+                params_.dlss5nr_auto_mask ? 1 : 0,
                 reset ? 1 : 0,
                 error,
                 sizeof(error)))

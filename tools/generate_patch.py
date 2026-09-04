@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -12,7 +11,20 @@ def replace(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
     if old not in text:
         raise RuntimeError(f"Expected source block not found in {path}")
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    # The explicit newline matters on Windows. read_text translates CRLF to LF,
+    # and write_text would expand it back to the platform ending, rewriting
+    # every line of a file we meant to touch in one place and burying the real
+    # change inside a whole-file diff.
+    path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+
+
+def copy_lf(source: Path, destination: Path) -> None:
+    """Copy a source file, normalising to LF.
+
+    The working copies in source/dlss5nr are CRLF, Blender's tree is LF, and the
+    patch has to be LF or git apply fails every hunk against a fresh checkout.
+    """
+    destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
 
 
 def main() -> None:
@@ -32,8 +44,8 @@ def main() -> None:
         raise RuntimeError("Blender checkout must be clean")
 
     destination = root / "intern/cycles/integrator"
-    shutil.copy2(project / "source/dlss5nr/denoiser_dlss5nr.h", destination)
-    shutil.copy2(project / "source/dlss5nr/denoiser_dlss5nr.cpp", destination)
+    copy_lf(project / "source/dlss5nr/denoiser_dlss5nr.h", destination / "denoiser_dlss5nr.h")
+    copy_lf(project / "source/dlss5nr/denoiser_dlss5nr.cpp", destination / "denoiser_dlss5nr.cpp")
 
     replace(
         root / "CMakeLists.txt",
@@ -173,6 +185,195 @@ def main() -> None:
         "    items += enum_openimagedenoise_denoiser(self, context)\n",
     )
 
+    # DLSS 5 NR appearance controls. The ABI exposes these and the model responds
+    # to them, but nothing reached them from Cycles: the denoiser passed fixed
+    # defaults for every one. Written as literal blocks rather than escaped
+    # strings so the inserted C++ reads the way it will land in the file.
+    replace(
+        root / "intern/cycles/device/denoise.h",
+        """  DenoiserPrefilter prefilter = DENOISER_PREFILTER_FAST;
+  DenoiserQuality quality = DENOISER_QUALITY_HIGH;
+""",
+        """  DenoiserPrefilter prefilter = DENOISER_PREFILTER_FAST;
+  DenoiserQuality quality = DENOISER_QUALITY_HIGH;
+
+  /* DLSS 5 NR appearance controls. These reach the model directly and are
+   * inert for every other denoiser. Style, structure and tone each move the
+   * image far more than the denoiser's own run to run variation; skin does
+   * nothing unless auto_mask is on, because the mask is what gives the model
+   * something material specific to act on. */
+  int dlss5nr_style = 1;
+  float dlss5nr_tone = 1.0f;
+  float dlss5nr_structure = 1.0f;
+  /* Negative leaves the model's own default alone. */
+  float dlss5nr_skin = -1.0f;
+  bool dlss5nr_auto_mask = false;
+""",
+    )
+    replace(
+        root / "intern/cycles/device/denoise.cpp",
+        """  SOCKET_ENUM(quality, "Quality", *quality_enum, DENOISER_QUALITY_HIGH);
+""",
+        """  SOCKET_ENUM(quality, "Quality", *quality_enum, DENOISER_QUALITY_HIGH);
+
+  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);
+  SOCKET_FLOAT(dlss5nr_tone, "DLSS5 NR Tone", 1.0f);
+  SOCKET_FLOAT(dlss5nr_structure, "DLSS5 NR Structure", 1.0f);
+  SOCKET_FLOAT(dlss5nr_skin, "DLSS5 NR Skin", -1.0f);
+  SOCKET_BOOLEAN(dlss5nr_auto_mask, "DLSS5 NR Auto Mask", false);
+""",
+    )
+    replace(
+        root / "intern/cycles/scene/integrator.h",
+        """  NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
+""",
+        """  NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
+
+  NODE_SOCKET_API(int, dlss5nr_style);
+  NODE_SOCKET_API(float, dlss5nr_tone);
+  NODE_SOCKET_API(float, dlss5nr_structure);
+  NODE_SOCKET_API(float, dlss5nr_skin);
+  NODE_SOCKET_API(bool, dlss5nr_auto_mask);
+""",
+    )
+    integrator_cpp = root / "intern/cycles/scene/integrator.cpp"
+    replace(
+        integrator_cpp,
+        """  SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
+""",
+        """  SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
+
+  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);
+  SOCKET_FLOAT(dlss5nr_tone, "DLSS5 NR Tone", 1.0f);
+  SOCKET_FLOAT(dlss5nr_structure, "DLSS5 NR Structure", 1.0f);
+  SOCKET_FLOAT(dlss5nr_skin, "DLSS5 NR Skin", -1.0f);
+  SOCKET_BOOLEAN(dlss5nr_auto_mask, "DLSS5 NR Auto Mask", false);
+""",
+    )
+    replace(
+        integrator_cpp,
+        """  denoise_params.prefilter = denoiser_prefilter;
+  denoise_params.quality = denoiser_quality;
+""",
+        """  denoise_params.prefilter = denoiser_prefilter;
+  denoise_params.quality = denoiser_quality;
+
+  denoise_params.dlss5nr_style = dlss5nr_style;
+  denoise_params.dlss5nr_tone = dlss5nr_tone;
+  denoise_params.dlss5nr_structure = dlss5nr_structure;
+  denoise_params.dlss5nr_skin = dlss5nr_skin;
+  denoise_params.dlss5nr_auto_mask = dlss5nr_auto_mask;
+""",
+    )
+    sync_cpp = root / "intern/cycles/blender/sync.cpp"
+    replace(
+        sync_cpp,
+        """  int input_passes = -1;
+""",
+        """  int input_passes = -1;
+
+  /* One set of DLSS 5 NR controls for both final and viewport denoising: they
+   * describe how the model should treat the image, not how much time to spend,
+   * so splitting them per context would only invite the two to disagree. */
+  denoising.dlss5nr_style = get_int(cscene, "dlss5nr_style");
+  denoising.dlss5nr_tone = get_float(cscene, "dlss5nr_tone");
+  denoising.dlss5nr_structure = get_float(cscene, "dlss5nr_structure");
+  denoising.dlss5nr_skin = get_float(cscene, "dlss5nr_skin");
+  denoising.dlss5nr_auto_mask = get_boolean(cscene, "dlss5nr_auto_mask");
+""",
+    )
+    replace(
+        sync_cpp,
+        """    integrator->set_denoiser_quality(denoise_params.quality);
+""",
+        """    integrator->set_denoiser_quality(denoise_params.quality);
+
+    integrator->set_dlss5nr_style(denoise_params.dlss5nr_style);
+    integrator->set_dlss5nr_tone(denoise_params.dlss5nr_tone);
+    integrator->set_dlss5nr_structure(denoise_params.dlss5nr_structure);
+    integrator->set_dlss5nr_skin(denoise_params.dlss5nr_skin);
+    integrator->set_dlss5nr_auto_mask(denoise_params.dlss5nr_auto_mask);
+""",
+    )
+
+    replace(
+        properties,
+        "    denoiser: EnumProperty(",
+        """    dlss5nr_style: EnumProperty(
+        name="Style",
+        description="Reconstruction style the DLSS 5 NR model applies",
+        items=(
+            ('DEFAULT', "Default", "Leave the runtime's own choice alone", 0),
+            ('NATURAL', "Natural", "Natural reconstruction", 1),
+            ('CINEMATIC', "Cinematic", "Cinematic reconstruction", 2),
+        ),
+        default='NATURAL',
+    )
+    dlss5nr_tone: FloatProperty(
+        name="Tone",
+        description="Local tone strength applied by the DLSS 5 NR model",
+        min=0.0, max=2.0, default=1.0,
+    )
+    dlss5nr_structure: FloatProperty(
+        name="Structure",
+        description="Local structure strength applied by the DLSS 5 NR model",
+        min=0.0, max=2.0, default=1.0,
+    )
+    dlss5nr_skin: FloatProperty(
+        name="Skin",
+        description=(
+            "Structure strength for regions the model identifies as skin. "
+            "Requires Auto Mask; below zero leaves the model default alone"
+        ),
+        min=-1.0, max=2.0, default=-1.0,
+    )
+    dlss5nr_auto_mask: BoolProperty(
+        name="Auto Mask",
+        description=(
+            "Let the model classify the image so material specific controls "
+            "such as Skin have something to act on"
+        ),
+        default=False,
+    )
+
+    denoiser: EnumProperty(""",
+    )
+    ui_py = root / "intern/cycles/blender/addon/ui.py"
+    replace(
+        ui_py,
+        "def get_effective_preview_denoiser(context, has_oidn_gpu):",
+        '''def draw_dlss5nr_options(layout, cscene):
+    # Skin is only meaningful once the model is classifying the image, so it is
+    # greyed out rather than hidden: hiding it makes the dependency invisible.
+    layout.prop(cscene, "dlss5nr_style", text="Style")
+    layout.prop(cscene, "dlss5nr_tone", text="Tone")
+    layout.prop(cscene, "dlss5nr_structure", text="Structure")
+    layout.prop(cscene, "dlss5nr_auto_mask", text="Auto Mask")
+    sub = layout.column()
+    sub.active = cscene.dlss5nr_auto_mask
+    sub.prop(cscene, "dlss5nr_skin", text="Skin")
+
+
+def get_effective_preview_denoiser(context, has_oidn_gpu):''',
+    )
+    replace(
+        ui_py,
+        '        col.prop(cscene, "preview_denoising_start_sample", text="Start Sample")\n',
+        """        if effective_preview_denoiser == 'DLSS5NR':
+            draw_dlss5nr_options(col, cscene)
+
+        col.prop(cscene, "preview_denoising_start_sample", text="Start Sample")
+""",
+    )
+    replace(
+        ui_py,
+        '        col.prop(cscene, "denoising_input_passes", text="Passes")\n',
+        """        col.prop(cscene, "denoising_input_passes", text="Passes")
+        if cscene.denoiser == 'DLSS5NR':
+            draw_dlss5nr_options(col, cscene)
+""",
+    )
+
     subprocess.run(
         [
             "git",
@@ -189,7 +390,9 @@ def main() -> None:
         ["git", "-C", str(root), "diff", "--binary", "--", "."], text=True
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(diff, encoding="utf-8")
+    # Same reason as replace(): the patch must stay LF or git apply fails
+    # every hunk, which .gitattributes also pins with "*.patch -text".
+    args.output.write_text(diff, encoding="utf-8", newline="\n")
     if not diff.strip():
         raise RuntimeError("Generated patch is empty")
     print(args.output)
