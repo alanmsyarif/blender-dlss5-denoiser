@@ -14,6 +14,16 @@ This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5
   than the area; 96x96 and 97x61 both work. The bridge refuses anything with a
   longer side below 96 and Cycles carries on. Between 65 and 95 is untested,
   since each probe means hanging the GPU again.
+- Most appearance controls the ABI exposes are not reachable from Cycles. The
+  bridge carries `DLSSNR.Style`, `LocalToneStrength`, `LocalStructureStrength`,
+  `SkinStructureStrength` and `UseAutoMask`, and the addon exposes all of them,
+  but the Cycles denoiser hardcodes every one to a default. Measured against a
+  fixed frame, Style moves the image 41 to 54%, Structure up to 66%, Tone 27%
+  and the automatic mask 12%, so these are not subtle. `SkinStructureStrength`
+  does nothing on its own and only takes effect with `UseAutoMask` enabled,
+  which is what makes it a material specific control rather than a global one.
+  `Hint.Render.Preset` and `Intensity` measured as exactly no change, so either
+  those names are wrong or the runtime ignores them.
 - Runtime compatibility is not guaranteed. Failure returns control to Cycles instead of crashing Blender, but output quality and stability require hardware testing.
 - `nvngx_dlssnr.dll` and `_nvngx.dll` are proprietary and never included.
 

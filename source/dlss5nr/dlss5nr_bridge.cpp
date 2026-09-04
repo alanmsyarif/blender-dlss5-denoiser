@@ -864,9 +864,16 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     // Always reset. This is Ray Reconstruction, so the model accumulates history
     // across evaluations, but the integration binds cleared depth and motion
     // guides: there is no correspondence between frames for it to accumulate
-    // along. Letting it try produced a 17% swing in output energy for identical
-    // input across repeated renders, which reads as flicker in the viewport,
-    // while OptiX and OpenImageDenoise are bit-stable on the same scene.
+    // along.
+    //
+    // The model itself is deterministic. Calling this function twice with the
+    // same pixels and the same parameters returns bit identical output. What
+    // varies is what Cycles hands it: progressive denoising and adaptive
+    // sampling mean successive evaluations see different accumulated buffers,
+    // and with reset off the model folded those differences into its history.
+    // Repeated renders of one fixed scene then spread 17% in output energy,
+    // which reads as flicker in the viewport. Resetting each evaluation halves
+    // that, and disabling adaptive sampling takes the remainder to about 2%.
     //
     // Once real depth and motion vectors are wired up this should become
     // (reset || rebuilt) again, and the accumulation is the point of using this
