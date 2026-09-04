@@ -133,6 +133,7 @@ static ComPtr<ID3D12Resource> g_color;
 static ComPtr<ID3D12Resource> g_output;
 static ComPtr<ID3D12Resource> g_depth;
 static ComPtr<ID3D12Resource> g_motion;
+static ComPtr<ID3D12Resource> g_upload_guide;
 static ComPtr<ID3D12Resource> g_upload;
 static ComPtr<ID3D12Resource> g_readback;
 static constexpr int kMinLongSide = 96;
@@ -144,6 +145,8 @@ static constexpr int kMinLongSide = 96;
 static float g_frame_max_in = 0.0f;
 static constexpr float kMaxOvershoot = 1.5f;
 static UINT g_width = 0, g_height = 0, g_row_pitch = 0;
+static UINT g_guide_row_pitch = 0;
+static UINT64 g_guide_bytes = 0;
 static UINT64 g_total_bytes = 0;
 // Every parameter the model latches at CreateFeature. Changing any of them has
 // no effect until the feature is rebuilt, so all of them are tracked.
@@ -530,10 +533,61 @@ static void ReleaseFeatureAndResources() {
         g_feature = nullptr;
     }
     g_color.Reset(); g_output.Reset(); g_upload.Reset(); g_readback.Reset();
-    g_depth.Reset(); g_motion.Reset();
+    g_depth.Reset(); g_motion.Reset(); g_upload_guide.Reset();
+    g_guide_row_pitch = 0; g_guide_bytes = 0;
     g_width = g_height = g_row_pitch = 0;
     g_total_bytes = 0;
     g_latched = LatchedParams{};
+}
+
+// Stage one guide texture through the shared upload buffer. Depth is R32_FLOAT
+// and motion is R16G16_FLOAT, both four bytes per pixel, so a single staging
+// buffer and row pitch serve both.
+static bool UploadGuideTexture(ID3D12Resource* texture,
+                               DXGI_FORMAT format,
+                               const void* packed_rows,
+                               UINT width,
+                               UINT height) {
+    if (!g_upload_guide || !texture) {
+        return false;
+    }
+    void* mapped = nullptr;
+    if (FAILED(g_upload_guide->Map(0, nullptr, &mapped)) || !mapped) {
+        return false;
+    }
+    auto* dst_base = static_cast<uint8_t*>(mapped);
+    const auto* src_base = static_cast<const uint8_t*>(packed_rows);
+    const size_t row_bytes = static_cast<size_t>(width) * 4u;
+    for (UINT y = 0; y < height; ++y) {
+        memcpy(dst_base + static_cast<size_t>(y) * g_guide_row_pitch,
+               src_base + static_cast<size_t>(y) * row_bytes,
+               row_bytes);
+    }
+    g_upload_guide->Unmap(0, nullptr);
+
+    auto to_copy = Barrier(texture,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                           D3D12_RESOURCE_STATE_COPY_DEST);
+    g_cmd->ResourceBarrier(1, &to_copy);
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = g_upload_guide.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint.Format = format;
+    src.PlacedFootprint.Footprint.Width = width;
+    src.PlacedFootprint.Footprint.Height = height;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = g_guide_row_pitch;
+    g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    auto to_read = Barrier(texture,
+                           D3D12_RESOURCE_STATE_COPY_DEST,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g_cmd->ResourceBarrier(1, &to_read);
+    return true;
 }
 
 static bool AllocateFrameResources(UINT w, UINT h) {
@@ -550,6 +604,11 @@ static bool AllocateFrameResources(UINT w, UINT h) {
 
     g_row_pitch = (w * 8u + 255u) & ~255u;
     g_total_bytes = static_cast<UINT64>(g_row_pitch) * h;
+    // Depth is R32_FLOAT and motion is R16G16_FLOAT, both four bytes per
+    // pixel, so one staging buffer and pitch covers both guides.
+    g_guide_row_pitch = (w * 4u + 255u) & ~255u;
+    g_guide_bytes = static_cast<UINT64>(g_guide_row_pitch) * h;
+    g_upload_guide = CreateLinearBuffer(g_guide_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     g_upload = CreateLinearBuffer(g_total_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     g_readback = CreateLinearBuffer(g_total_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     if (!g_upload || !g_readback) { SetError("Failed to create D3D12 upload/readback buffers"); return false; }
@@ -819,8 +878,10 @@ __declspec(dllexport) int __cdecl dlss5nr_init(int gpu_index, const wchar_t* run
     return 1;
 }
 
-__declspec(dllexport) int __cdecl dlss5nr_process(
-    const float* rgb_in, float* rgb_out, int width, int height,
+static int ProcessInternal(
+    const float* rgb_in, float* rgb_out,
+    const float* depth_in, const float* motion_in,
+    int width, int height,
     int style, int preset, float intensity, float tone, float structure, float skin,
     int automask, int reset, char* err, int err_cap) {
 
@@ -878,8 +939,12 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     // Once real depth and motion vectors are wired up this should become
     // (reset || rebuilt) again, and the accumulation is the point of using this
     // model at all.
-    (void)rebuilt;
-    SetEvalParams(1);
+    // With real depth and motion the model has frame to frame correspondence and
+    // can accumulate, which is the point of Ray Reconstruction. Without them
+    // there is nothing to accumulate along, and letting it try produced a 17%
+    // swing in output energy between renders, which reads as flicker.
+    const bool have_guides = (depth_in != nullptr && motion_in != nullptr);
+    SetEvalParams((!have_guides || reset || rebuilt) ? 1 : 0);
 
     void* mapped = nullptr;
     HRESULT hr = g_upload->Map(0, nullptr, &mapped);
@@ -914,6 +979,20 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     auto b2 = Barrier(g_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     g_cmd->ResourceBarrier(1, &b2);
+
+    if (depth_in) {
+        UploadGuideTexture(g_depth.Get(), DXGI_FORMAT_R32_FLOAT, depth_in,
+                           static_cast<UINT>(width), static_cast<UINT>(height));
+    }
+    if (motion_in) {
+        // Two floats per pixel in, one R16G16 texel out.
+        std::vector<uint16_t> packed(static_cast<size_t>(width) * static_cast<size_t>(height) * 2u);
+        for (size_t i = 0; i < packed.size(); ++i) {
+            packed[i] = FloatToHalf(motion_in[i]);
+        }
+        UploadGuideTexture(g_motion.Get(), DXGI_FORMAT_R16G16_FLOAT, packed.data(),
+                           static_cast<UINT>(width), static_cast<UINT>(height));
+    }
 
     NGXResult er = g_shim_eval(reinterpret_cast<void*>(g_nr_eval), g_cmd.Get(), g_feature, g_params, nullptr);
     if (er != NGX_SUCCESS) {
@@ -961,6 +1040,28 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     g_readback->Unmap(0, nullptr);
     CopyError(err, err_cap);
     return 1;
+}
+
+__declspec(dllexport) int __cdecl dlss5nr_process(
+    const float* rgb_in, float* rgb_out, int width, int height,
+    int style, int preset, float intensity, float tone, float structure, float skin,
+    int automask, int reset, char* err, int err_cap) {
+    // Colour only. The guide textures stay as allocated, and the evaluate is
+    // reset every time because there is no correspondence between frames.
+    return ProcessInternal(rgb_in, rgb_out, nullptr, nullptr, width, height, style, preset,
+                           intensity, tone, structure, skin, automask, reset, err, err_cap);
+}
+
+// depth_in is one float per pixel, motion_in two, both tightly packed and both
+// in the same layout as rgb_in. Passing either as null falls back to the colour
+// only path above.
+__declspec(dllexport) int __cdecl dlss5nr_process_guided(
+    const float* rgb_in, float* rgb_out, const float* depth_in, const float* motion_in,
+    int width, int height,
+    int style, int preset, float intensity, float tone, float structure, float skin,
+    int automask, int reset, char* err, int err_cap) {
+    return ProcessInternal(rgb_in, rgb_out, depth_in, motion_in, width, height, style, preset,
+                           intensity, tone, structure, skin, automask, reset, err, err_cap);
 }
 
 __declspec(dllexport) void __cdecl dlss5nr_shutdown() {

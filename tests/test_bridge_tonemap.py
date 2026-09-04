@@ -83,6 +83,17 @@ class BridgeStagingTests(unittest.TestCase):
             "colour is being clamped to 0..1 again before the model sees it",
         )
 
+    def test_guided_path_is_exported(self):
+        # The colour only export has to stay, because the Cycles side resolves
+        # the guided one optionally and falls back when it is missing.
+        self.assertIn("dlss5nr_process_guided", self.source)
+        self.assertIn("__cdecl dlss5nr_process(", self.source)
+
+    def test_reset_is_forced_without_guides(self):
+        # Accumulating against cleared depth and motion is what produced the
+        # 17% swing in output energy between renders.
+        self.assertIn("!have_guides || reset || rebuilt", self.source)
+
     def test_constants_match_the_python_mirror(self):
         self.assertIn("1.0f - 1.0f / 2048.0f", self.source)
         self.assertIn("kKneeStart = 0.8f", self.source)

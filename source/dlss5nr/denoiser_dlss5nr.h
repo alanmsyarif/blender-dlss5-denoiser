@@ -47,15 +47,38 @@ class DLSS5NRDenoiser final : public Denoiser {
                                    int,
                                    char *,
                                    int);
+  /* Same as ProcessFn with depth and motion guides inserted after the colour
+   * buffers. Resolved separately so an older bridge without it still works. */
+  using ProcessGuidedFn = int(__cdecl *)(const float *,
+                                         float *,
+                                         const float *,
+                                         const float *,
+                                         int,
+                                         int,
+                                         int,
+                                         int,
+                                         float,
+                                         float,
+                                         float,
+                                         float,
+                                         int,
+                                         int,
+                                         char *,
+                                         int);
   using ShutdownFn = void(__cdecl *)();
 
   HMODULE bridge_module_ = nullptr;
   InitFn init_ = nullptr;
   ProcessFn process_ = nullptr;
+  ProcessGuidedFn process_guided_ = nullptr;
   ShutdownFn shutdown_ = nullptr;
 #endif
   bool initialized_ = false;
   bool failed_ = false;
+  /* Log the guide state once, and again only when it changes. Tri-state, so
+   * the first call reports even when guides are absent: that is precisely
+   * the case where the user needs to be told why nothing is accumulating. */
+  int guides_logged_ = -1;
   int width_ = 0;
   int height_ = 0;
 };

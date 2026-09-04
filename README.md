@@ -5,7 +5,16 @@ This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5
 ## Important limitations
 
 - Windows x64 and NVIDIA RTX only. RTX 20 and non-RTX are not supported; Ada and Blackwell are the primary targets and Ampere is slow.
-- This integration runs same-resolution and colour-only. That is a limit of this integration, not of the ABI: feature 18 also exposes `DLSSNR.Depth`, `DLSSNR.MVec` and an upscaling path. Cycles depth and motion guides are not wired up yet, so cleared guide textures are bound and the model behaves as a single-frame spatial denoiser. This is not full temporal DLSS Ray Reconstruction.
+- Temporal accumulation needs the Z and Vector passes. When the view layer
+  carries both, Cycles' depth and motion are uploaded as `DLSSNR.Depth` and
+  `DLSSNR.MVec` and the model accumulates across evaluations, which is what
+  Ray Reconstruction is built around; the console says which mode is in use.
+  Without them the guides stay cleared and every evaluation resets, because
+  accumulating against absent correspondence produced a 17% swing in output
+  energy between identical renders. Measured on a fixed scene, real guides
+  take the spread from 2.5% to 1.1%.
+- Still same-resolution. `DLSSNR.Upscaling` is a separate flag the bridge
+  leaves off, and Cycles has no upscaling stage for a denoiser to feed.
 - HDR is compressed rather than discarded. The bridge's FP16 staging path applies a Reinhard curve, encodes to sRGB for the model, then inverts both on the way out, so values above 1.0 survive with reduced precision instead of being clipped. Measured against OpenImageDenoise on the same frame, the denoised result keeps 92% of the reference image energy and runs slightly conservative in the highlights, around 0.94x in the 1..15 range and 0.86x above 15. The previous hard clamp to 0..1 kept 51% and flattened 16% of the image onto exactly 1.0.
 - Frames with a short longer side are refused. A 64x64 evaluate hangs the GPU
   outright, returning `DXGI_ERROR_DEVICE_HUNG`, and the device never comes back,
