@@ -6,6 +6,32 @@
 
 $ErrorActionPreference = 'Stop'
 
+function Invoke-Native {
+    <#
+    .SYNOPSIS
+    Run a native executable without letting its stderr abort the script.
+
+    .DESCRIPTION
+    Windows PowerShell 5.1 wraps every line a native command writes to stderr in
+    a NativeCommandError. Under ErrorActionPreference='Stop' that is terminating,
+    so the script dies on output that is merely informational: a single CMake
+    dev warning from find_package was enough to abort a configure halfway, with
+    the real error nowhere in the transcript.
+
+    Exit code is the only reliable success signal for a native tool, so callers
+    check $LASTEXITCODE themselves. This just keeps stderr non-fatal while the
+    command runs, and restores the previous preference afterwards.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(ValueFromRemainingArguments = $true)] [string[]] $Arguments = @()
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Path @Arguments }
+    finally { $ErrorActionPreference = $previous }
+}
+
 function Fail([string]$Message) {
     Write-Host ""
     Write-Host "[DLSS5-NR] ERROR: $Message" -ForegroundColor Red
@@ -109,6 +135,24 @@ if (Test-Path (Join-Path $MsvcSdkBin 'rc.exe')) {
 }
 else {
     Write-Host "[DLSS5-NR] WARNING: rc.exe not found in $MsvcSdkBin" -ForegroundColor Yellow
+}
+
+# The CUDA Toolkit is optional: only a build with WITH_CYCLES_CUDA_BINARIES=ON
+# needs nvcc. When it is installed, put it on PATH and export CUDA_PATH, because
+# CMake's FindCUDA looks for exactly those and finds neither in a shell that was
+# started before the toolkit was installed. Without this the configure prints
+# "Could NOT find CUDA (missing: CUDA_TOOLKIT_ROOT_DIR CUDA_NVCC_EXECUTABLE ...)"
+# and silently produces a Blender that enumerates no GPU at all.
+$cudaRoot = Get-ChildItem -Path (Join-Path $pf 'NVIDIA GPU Computing Toolkit\CUDA') -Directory -ErrorAction SilentlyContinue |
+    Where-Object { Test-Path (Join-Path $_.FullName 'bin\nvcc.exe') } |
+    Sort-Object {
+        if ($_.Name -match '^v([0-9]+)\.([0-9]+)$') { [version]"$($Matches[1]).$($Matches[2])" } else { [version]'0.0' }
+    } -Descending | Select-Object -First 1
+
+if ($cudaRoot) {
+    $env:CUDA_PATH = $cudaRoot.FullName
+    $env:PATH = "$(Join-Path $cudaRoot.FullName 'bin');$env:PATH"
+    Write-Host "[DLSS5-NR] CUDA:        $($cudaRoot.FullName)"
 }
 
 # Visual Studio ships a CMake that is not on PATH by default. Blender's

@@ -34,6 +34,11 @@ New-Item -ItemType Directory -Force $releaseDir | Out-Null
 $publicPdb = (Join-Path $releaseDir 'blender_public.pdb') -replace '\\', '/'
 
 Push-Location $Build
+# link.exe and mt.exe both write progress and warnings to stderr, which
+# PowerShell 5.1 turns into terminating NativeCommandErrors under 'Stop'.
+# Exit codes are checked explicitly below.
+$previousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 try {
   & $link /nologo "@CMakeFiles\blender_multiline.rsp" `
     /out:bin\blender.exe /implib:bin\blender.lib `
@@ -52,6 +57,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "mt.exe failed with exit code $LASTEXITCODE." }
 }
 finally {
+  $ErrorActionPreference = $previousErrorAction
   Pop-Location
 }
 

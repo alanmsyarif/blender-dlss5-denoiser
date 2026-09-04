@@ -106,7 +106,7 @@ if ($GpuOff) {
 
 Write-Host ""
 Write-Host "[DLSS5-NR] Configuring: $Build"
-& cmake @cmakeArgs
+Invoke-Native cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE." }
 
 if ($ConfigureOnly) {
@@ -116,7 +116,7 @@ if ($ConfigureOnly) {
 
 Write-Host ""
 Write-Host "[DLSS5-NR] Building..."
-& cmake --build $Build --parallel
+Invoke-Native cmake --build $Build --parallel
 if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE." }
 
 Write-Host ""
