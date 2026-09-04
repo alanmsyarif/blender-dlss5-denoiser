@@ -194,6 +194,23 @@ did nothing: `OutWidth`, `OutHeight`, `DLSSNR.InputWidth`, `DLSSNR.InputHeight`,
 removed. `DLSSNR.Upscaling` in particular made the bridge look like it was
 choosing same-resolution operation when it was only failing to ask for anything.
 
+Cross-checked against the two projects that inject this runtime into games,
+[DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder) and
+[1-Click-DLSS5](https://github.com/reiluisii/1-Click-DLSS5). Both drive the same
+feature 18 and both do what this project does: hand it colour, depth and motion
+vectors and take a reconstructed frame back. Neither implements generative
+lighting, indirect or bounced light, or material simulation either.
+
+Their settings names are their own, not NVIDIA's. `NeuralUplift`, `NRStyle`,
+`NRGlobalTone`, `NREnableUpscaling`, `NRToggleKey` and `EnableHooks` appear
+nowhere in `nvngx_dlssnr.dll`; they belong to the add-on shim those projects load
+and map onto the `DLSSNR.*` names above, `NRStyle` onto `Style`, `NRGlobalTone`
+onto `LocalToneStrength`, `NREnableUpscaling` onto `ScalingRatio`.
+
+For completeness the same scan finds no occurrence anywhere in the 165 MB binary
+of Generative, Radiance, Bounce, Indirect, Semantic, Hair, Fabric, Subsurface,
+Material or Lighting, and `DLSSNR` is the only parameter namespace it contains.
+
 Real parameters still unused, each a separate piece of work:
 
 - `ScalingRatio` is the actual upscaling control, not the `Upscaling` flag this
