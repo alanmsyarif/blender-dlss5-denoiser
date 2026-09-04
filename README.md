@@ -6,7 +6,7 @@ This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5
 
 - Windows x64 and NVIDIA RTX only. RTX 20 and non-RTX are not supported; Ada and Blackwell are the primary targets and Ampere is slow.
 - This integration runs same-resolution and colour-only. That is a limit of this integration, not of the ABI: feature 18 also exposes `DLSSNR.Depth`, `DLSSNR.MVec` and an upscaling path. Cycles depth and motion guides are not wired up yet, so cleared guide textures are bound and the model behaves as a single-frame spatial denoiser. This is not full temporal DLSS Ray Reconstruction.
-- HDR values are constrained by the bridge's normalized FP16 staging path: colour is clamped to 0..1, encoded to sRGB for the model, and decoded back to linear. Anything above 1.0 in the render is crushed before denoising.
+- HDR is compressed rather than discarded. The bridge's FP16 staging path applies a Reinhard curve, encodes to sRGB for the model, then inverts both on the way out, so values above 1.0 survive with reduced precision instead of being clipped. Measured against OpenImageDenoise on the same frame, the denoised result keeps 92% of the reference image energy and runs slightly conservative in the highlights, around 0.94x in the 1..15 range and 0.86x above 15. The previous hard clamp to 0..1 kept 51% and flattened 16% of the image onto exactly 1.0.
 - Runtime compatibility is not guaranteed. Failure returns control to Cycles instead of crashing Blender, but output quality and stability require hardware testing.
 - `nvngx_dlssnr.dll` and `_nvngx.dll` are proprietary and never included.
 
@@ -64,6 +64,11 @@ gpu      NVIDIA GeForce RTX 5050
 abi      Init_Ext order=1 (version, info); param slots uint=3 float=6
 process  SUCCESS
 ```
+
+The full Cycles path is confirmed on the same machine: with an OptiX device
+selected, `DLSS 5 NR (Experimental)` denoises a final render end to end. Inside
+the range the model represents, its output correlates with OpenImageDenoise at
+0.988, so the model itself behaves; the staging path is what bounds quality.
 
 Three things the ABI turned out to require, none of which are guessable from the public headers:
 
