@@ -625,17 +625,18 @@ static void SetCreateParams(const LatchedParams& p) {
     // pair and which one is not documented.
     VSetUInt("Width", g_width);
     VSetUInt("Height", g_height);
-    VSetUInt("OutWidth", g_width);
-    VSetUInt("OutHeight", g_height);
     VSetUInt("PerfQualityValue", 2);
     VSetUInt("DLSSNR.Enabled", 1);
     VSetUInt("DLSSNR.Width", g_width);
     VSetUInt("DLSSNR.Height", g_height);
-    VSetUInt("DLSSNR.InputWidth", g_width);
-    VSetUInt("DLSSNR.InputHeight", g_height);
-    VSetUInt("DLSSNR.OutputWidth", g_width);
-    VSetUInt("DLSSNR.OutputHeight", g_height);
-    VSetUInt("DLSSNR.Upscaling", 0);
+    /* Only names the runtime actually contains are set here. Scanning
+     * nvngx_dlssnr.dll for its parameter strings showed that OutWidth,
+     * OutHeight, DLSSNR.InputWidth, DLSSNR.InputHeight, DLSSNR.OutputWidth,
+     * DLSSNR.OutputHeight and DLSSNR.Upscaling do not exist in it at all, so
+     * setting them did nothing and made the bridge look like it was choosing
+     * same-resolution operation when it was only failing to ask for anything.
+     * The real resolution control is DLSSNR.ScalingRatio, which is left unset
+     * because the upscaling path is not wired up. */
     VSetUInt("DLSSNR.Style", static_cast<unsigned>(p.style));
     VSetUInt("DLSSNR.Hint.Render.Preset", static_cast<unsigned>(p.preset));
     VSetFloat("DLSSNR.Intensity", p.intensity);

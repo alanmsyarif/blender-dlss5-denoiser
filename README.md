@@ -13,8 +13,9 @@ This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5
   accumulating against absent correspondence produced a 17% swing in output
   energy between identical renders. Measured on a fixed scene, real guides
   take the spread from 2.5% to 1.1%.
-- Still same-resolution. `DLSSNR.Upscaling` is a separate flag the bridge
-  leaves off, and Cycles has no upscaling stage for a denoiser to feed.
+- Still same-resolution. `DLSSNR.ScalingRatio` is the runtime's upscaling
+  control and is left unset, and Cycles has no upscaling stage for a denoiser
+  to feed regardless: a denoiser writes back into the buffer it was given.
 - HDR is compressed rather than discarded. The bridge's FP16 staging path applies a Reinhard curve, encodes to sRGB for the model, then inverts both on the way out, so values above 1.0 survive with reduced precision instead of being clipped. Measured against OpenImageDenoise on the same frame, the denoised result keeps 92% of the reference image energy and runs slightly conservative in the highlights, around 0.94x in the 1..15 range and 0.86x above 15. The previous hard clamp to 0..1 kept 51% and flattened 16% of the image onto exactly 1.0.
 - Frames with a short longer side are refused. A 64x64 evaluate hangs the GPU
   outright, returning `DXGI_ERROR_DEVICE_HUNG`, and the device never comes back,
@@ -165,6 +166,43 @@ Three things the ABI turned out to require, none of which are guessable from the
 - `Init_Ext` takes the public NGX argument order, `(app, path, device, version, info)`.
 - The capability block's float setter is at vtable slot 6, not slot 1 as the SDK header implies. Slots are probed at runtime.
 - The NGX modules must never be unloaded. `FreeLibrary` on the driver's `_nvngx.dll` deadlocks the same way, so they stay resident for the process lifetime.
+
+## What feature 18 actually exposes
+
+Scanning `nvngx_dlssnr.dll` 310.8.0 for its own parameter strings gives the
+complete surface: 61 names, and nothing outside them will be read.
+
+Inputs and outputs: `Color`, `Depth`, `MVec`, `Output`, `Backbuffer`, `UI`,
+`UIAlpha`, `ControlMask`, `BidirectionalDistortionField`, each with
+`...SubrectBaseX/BaseY/Width/Height`.
+
+Controls: `Enabled`, `Reset`, `Width`, `Height`, `ScalingRatio`,
+`DepthInverted`, `MVecScaleX`, `MVecScaleY`, `Style`, `Hint.Render.Preset`,
+`Intensity`, `LocalToneStrength`, `LocalStructureStrength`,
+`SkinStructureStrength`, `UseAutoMask`, `UICorrection`.
+
+That is a denoiser with appearance controls and a UI compositing path. There is
+no parameter for generative lighting, indirect or bounced light, scene semantics,
+hair or fabric. Whatever those product descriptions refer to, this feature does
+not expose it, so it is not something this project has failed to switch on. Ray
+Reconstruction reconstructs lighting from the samples the renderer traced; it
+does not add light that was never traced.
+
+Names this project sets that the runtime does not contain, and which therefore
+did nothing: `OutWidth`, `OutHeight`, `DLSSNR.InputWidth`, `DLSSNR.InputHeight`,
+`DLSSNR.OutputWidth`, `DLSSNR.OutputHeight`, `DLSSNR.Upscaling`. They have been
+removed. `DLSSNR.Upscaling` in particular made the bridge look like it was
+choosing same-resolution operation when it was only failing to ask for anything.
+
+Real parameters still unused, each a separate piece of work:
+
+- `ScalingRatio` is the actual upscaling control, not the `Upscaling` flag this
+  project used to set.
+- `ControlMask` takes a mask texture, so material specific behaviour such as
+  `SkinStructureStrength` can be driven explicitly instead of relying on
+  `UseAutoMask` to classify the frame.
+- `Backbuffer`, `UI` and `UIAlpha` drive the UI compositing path.
+- `BidirectionalDistortionField` handles lens distortion.
 
 ## References
 
