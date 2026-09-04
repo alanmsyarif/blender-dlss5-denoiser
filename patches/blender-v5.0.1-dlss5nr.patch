@@ -175,11 +175,15 @@ index 7468bb03..9e4c54ce 100644
      PyModule_AddObjectRef(mod, "with_openimagedenoise", Py_True);
    }
 diff --git a/intern/cycles/blender/sync.cpp b/intern/cycles/blender/sync.cpp
-index 239b234d..c1074fe1 100644
+index 239b234d..37a3a917 100644
 --- a/intern/cycles/blender/sync.cpp
 +++ b/intern/cycles/blender/sync.cpp
-@@ -540,6 +540,13 @@ void BlenderSync::sync_integrator(BL::ViewLayer &b_view_layer,
+@@ -538,8 +538,17 @@ void BlenderSync::sync_integrator(BL::ViewLayer &b_view_layer,
+     integrator->set_denoise_start_sample(denoise_params.start_sample);
+     integrator->set_use_denoise_pass_albedo(denoise_params.use_pass_albedo);
      integrator->set_use_denoise_pass_normal(denoise_params.use_pass_normal);
++    /* Only DLSS 5 NR consumes depth, and asking for it costs a pass. */
++    integrator->set_use_denoise_pass_depth(denoise_params.type == DENOISER_DLSS5NR);
      integrator->set_denoiser_prefilter(denoise_params.prefilter);
      integrator->set_denoiser_quality(denoise_params.quality);
 +
@@ -192,7 +196,7 @@ index 239b234d..c1074fe1 100644
    }
  
    /* UPDATE_NONE as we don't want to tag the integrator as modified (this was done by the
-@@ -1035,6 +1042,16 @@ DenoiseParams BlenderSync::get_denoise_params(BL::Scene &b_scene,
+@@ -1035,6 +1044,16 @@ DenoiseParams BlenderSync::get_denoise_params(BL::Scene &b_scene,
  
    int input_passes = -1;
  
@@ -360,12 +364,41 @@ index b5791118..a94a9b20 100644
  #ifdef WITH_OPTIX
      if (use_optix_denoiser(single_denoiser_device, effective_denoiser_params)) {
        return make_unique<OptiXDenoiser>(single_denoiser_device, effective_denoiser_params);
+diff --git a/intern/cycles/integrator/denoiser.h b/intern/cycles/integrator/denoiser.h
+index c2e82e93..946e832f 100644
+--- a/intern/cycles/integrator/denoiser.h
++++ b/intern/cycles/integrator/denoiser.h
+@@ -10,6 +10,7 @@
+ #include <functional>
+ 
+ #include "device/denoise.h"
++#include "util/projection.h"
+ #include "device/device.h"
+ #include "util/unique_ptr.h"
+ 
+@@ -89,6 +90,16 @@ class Denoiser {
+    *
+    * Returns true when all passes are denoised. Will return false if there is a denoiser error (for
+    * example, caused by misconfigured denoiser) or when user requested to cancel rendering. */
++  /* Camera state for this evaluation. Only a denoiser that reprojects between
++   * frames needs it, so the base ignores it. Passed as plain transforms rather
++   * than the kernel camera so this header keeps out of kernel types. */
++  virtual void set_camera(const ProjectionTransform & /*worldtoraster*/,
++                          const ProjectionTransform & /*rastertocamera*/,
++                          const Transform & /*cameratoworld*/,
++                          bool /*can_reproject*/)
++  {
++  }
++
+   virtual bool denoise_buffer(const BufferParams &buffer_params,
+                               RenderBuffers *render_buffers,
+                               const int num_samples,
 diff --git a/intern/cycles/integrator/denoiser_dlss5nr.cpp b/intern/cycles/integrator/denoiser_dlss5nr.cpp
 new file mode 100644
-index 00000000..b2f64724
+index 00000000..c70443dc
 --- /dev/null
 +++ b/intern/cycles/integrator/denoiser_dlss5nr.cpp
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,368 @@
 +/* SPDX-FileCopyrightText: 2026 Blender DLSS5 NR contributors
 + *
 + * SPDX-License-Identifier: Apache-2.0 */
@@ -409,6 +442,17 @@ index 00000000..b2f64724
 +  (void)device;
 +  return false;
 +#endif
++}
++
++void DLSS5NRDenoiser::set_camera(const ProjectionTransform &worldtoraster,
++                                 const ProjectionTransform &rastertocamera,
++                                 const Transform &cameratoworld,
++                                 const bool can_reproject)
++{
++  worldtoraster_ = worldtoraster;
++  rastertocamera_ = rastertocamera;
++  cameratoworld_ = cameratoworld;
++  can_reproject_ = can_reproject;
 +}
 +
 +bool DLSS5NRDenoiser::ensure_runtime()
@@ -550,22 +594,25 @@ index 00000000..b2f64724
 +   * adaptive sampling the count is per pixel, not the scene-wide num_samples. */
 +  const int sample_count_offset = buffer_params.get_pass_offset(PASS_SAMPLE_COUNT);
 +
-+  /* Guides are opportunistic. Cycles only carries these passes when the view
-+   * layer asks for them, so a render without the Z and Vector passes gets the
-+   * colour only path and an evaluate that resets every frame. With both present
-+   * the model has frame to frame correspondence and can accumulate, which is
-+   * what Ray Reconstruction is built around. */
++  /* Motion is reprojected from depth and the camera rather than read from
++   * PASS_MOTION. That pass describes motion between animation frames: on a still
++   * render the previous and next frames are the current one, so every vector is
++   * zero, and the viewport never changes frame at all. Measured, a still render
++   * reported motion mean |v| 0 max 0 where an animated frame reported 18.9.
++   *
++   * Reprojection describes motion between denoiser evaluations instead, which is
++   * what the model accumulates along. It covers camera movement only: an object
++   * moving while the camera holds still is not represented, because nothing in
++   * the depth buffer says it moved. */
 +  const int depth_offset = buffer_params.get_pass_offset(PASS_DEPTH);
-+  const int motion_offset = buffer_params.get_pass_offset(PASS_MOTION);
-+  const int motion_weight_offset = buffer_params.get_pass_offset(PASS_MOTION_WEIGHT);
 +  const bool use_guides = process_guided_ != nullptr && depth_offset != PASS_UNUSED &&
-+                          motion_offset != PASS_UNUSED;
++                          can_reproject_;
 +  if (guides_logged_ != int(use_guides)) {
 +    guides_logged_ = int(use_guides);
 +    LOG_INFO << "DLSS 5 NR guides "
 +             << (use_guides ? "active: depth and motion, temporal accumulation on" :
 +                              "absent: colour only, resetting every frame. Enable the "
-+                              "Z and Vector passes for temporal accumulation");
++                              "Z pass for reprojected motion");
 +  }
 +
 +  render_buffers->copy_from_device();
@@ -602,24 +649,36 @@ index 00000000..b2f64724
 +         * and at 1024 samples it would have been indistinguishable from an
 +         * empty buffer. */
 +        depth[image_index] = pixels[buffer_index + depth_offset];
-+        /* The motion pass is accumulated against its own weight rather than the
-+         * sample count, which is what divide_type on PASS_MOTION means. Only the
-+         * first two components are used: they are the vector back to where this
-+         * pixel was in the previous frame, which is the correspondence the model
-+         * needs. The last two point at the next frame and are for vector blur. */
-+        float motion_scale = inv_scale;
-+        if (motion_weight_offset != PASS_UNUSED) {
-+          const float weight = pixels[buffer_index + motion_weight_offset];
-+          motion_scale = weight > 0.0f ? 1.0f / weight : 0.0f;
++        /* Take the pixel centre back out along its camera ray to the recorded
++         * depth, into the world, then into where the previous evaluation's
++         * camera would have put it. The difference is the vector the model
++         * wants: where this pixel was last time. */
++        float motion_x = 0.0f;
++        float motion_y = 0.0f;
++        if (has_previous_camera_ && depth[image_index] > 0.0f) {
++          const float3 raster = make_float3(float(buffer_params.full_x + x) + 0.5f,
++                                            float(buffer_params.full_y + y) + 0.5f,
++                                            0.0f);
++          const float3 camera_point = transform_perspective(&rastertocamera_, raster);
++          if (camera_point.z != 0.0f) {
++            const float3 at_depth = camera_point * (depth[image_index] / camera_point.z);
++            const float3 world = transform_point(&cameratoworld_, at_depth);
++            const float3 previous = transform_perspective(&previous_worldtoraster_, world);
++            motion_x = previous.x - raster.x;
++            motion_y = previous.y - raster.y;
++          }
 +        }
-+        motion[image_index * 2 + 0] = pixels[buffer_index + motion_offset + 0] * motion_scale;
-+        motion[image_index * 2 + 1] = pixels[buffer_index + motion_offset + 1] * motion_scale;
++        motion[image_index * 2 + 0] = motion_x;
++        motion[image_index * 2 + 1] = motion_y;
 +      }
 +    }
 +  }
 +
-+    if (use_guides && !guide_stats_logged_) {
-+    guide_stats_logged_ = true;
++  /* Report once at the start, and again the first time the camera actually
++   * moves. The first evaluation always has nothing to reproject from, so
++   * reporting only there would show a zero motion field however well
++   * reprojection works. */
++  if (use_guides && guide_stats_logged_ < 2) {
 +    float dmin = depth.empty() ? 0.0f : depth[0];
 +    float dmax = dmin;
 +    for (const float d : depth) {
@@ -632,13 +691,17 @@ index 00000000..b2f64724
 +      mmax = std::max(mmax, std::fabs(m));
 +      msum += std::fabs(m);
 +    }
-+    LOG_INFO << "DLSS 5 NR guide stats: depth " << dmin << " to " << dmax
-+             << ", motion mean |v| " << (motion.empty() ? 0.0 : msum / motion.size())
-+             << " max " << mmax;
++    if (guide_stats_logged_ == 0 || mmax > 0.0f) {
++      guide_stats_logged_ = (mmax > 0.0f) ? 2 : 1;
++      LOG_INFO << "DLSS 5 NR guide stats: depth " << dmin << " to " << dmax
++               << ", motion mean |v| " << (motion.empty() ? 0.0 : msum / motion.size())
++               << " max " << mmax;
++    }
 +  }
 +
 +char error[1024] = {};
-+  const bool reset = width_ != buffer_params.width || height_ != buffer_params.height;
++  const bool reset = width_ != buffer_params.width || height_ != buffer_params.height ||
++                     (use_guides && !has_previous_camera_);
 +  const int ok = use_guides ? process_guided_(input.data(),
 +                                             output.data(),
 +                                             depth.data(),
@@ -682,6 +745,10 @@ index 00000000..b2f64724
 +  }
 +  width_ = buffer_params.width;
 +  height_ = buffer_params.height;
++  if (use_guides) {
++    previous_worldtoraster_ = worldtoraster_;
++    has_previous_camera_ = true;
++  }
 +
 +  for (int y = 0; y < buffer_params.height; ++y) {
 +    for (int x = 0; x < buffer_params.width; ++x) {
@@ -702,10 +769,10 @@ index 00000000..b2f64724
 +CCL_NAMESPACE_END
 diff --git a/intern/cycles/integrator/denoiser_dlss5nr.h b/intern/cycles/integrator/denoiser_dlss5nr.h
 new file mode 100644
-index 00000000..1889a867
+index 00000000..9076b797
 --- /dev/null
 +++ b/intern/cycles/integrator/denoiser_dlss5nr.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,105 @@
 +/* SPDX-FileCopyrightText: 2026 Blender DLSS5 NR contributors
 + *
 + * SPDX-License-Identifier: Apache-2.0 */
@@ -731,6 +798,11 @@ index 00000000..1889a867
 +                      bool allow_inplace_modification) override;
 +
 +  static bool is_device_supported(const DeviceInfo &device);
++
++  void set_camera(const ProjectionTransform &worldtoraster,
++                  const ProjectionTransform &rastertocamera,
++                  const Transform &cameratoworld,
++                  bool can_reproject) override;
 +
 + protected:
 +  uint get_device_type_mask() const override;
@@ -787,16 +859,66 @@ index 00000000..1889a867
 +   * the first call reports even when guides are absent: that is precisely
 +   * the case where the user needs to be told why nothing is accumulating. */
 +  int guides_logged_ = -1;
++
++  /* Camera for this evaluation, and the one from the previous evaluation.
++   * Motion vectors are the difference between where a point lands now and
++   * where it landed then, so the previous frame is the whole state this
++   * denoiser has to carry. */
++  ProjectionTransform worldtoraster_;
++  ProjectionTransform rastertocamera_;
++  Transform cameratoworld_;
++  ProjectionTransform previous_worldtoraster_;
++  bool can_reproject_ = false;
++  bool has_previous_camera_ = false;
 +  /* Report the actual guide ranges once, so a plausible looking but useless
 +   * depth or an all zero motion field cannot hide. */
-+  bool guide_stats_logged_ = false;
++  int guide_stats_logged_ = 0;
 +  int width_ = 0;
 +  int height_ = 0;
 +};
 +
 +CCL_NAMESPACE_END
+diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/path_trace.cpp
+index f806a85f..b4476c51 100644
+--- a/intern/cycles/integrator/path_trace.cpp
++++ b/intern/cycles/integrator/path_trace.cpp
+@@ -638,6 +638,17 @@ void PathTrace::denoise(const RenderWork &render_work)
+     buffer_to_denoise = path_trace_works_.front()->get_render_buffers();
+   }
+ 
++  /* Reprojection needs to know where the camera is now; the denoiser remembers
++   * where it was. Only perspective and orthographic cameras have the raster
++   * mapping this depends on. */
++  {
++    const KernelCamera &cam = device_scene_->data.cam;
++    denoiser_->set_camera(cam.worldtoraster,
++                          cam.rastertocamera,
++                          cam.cameratoworld,
++                          cam.type == CAMERA_PERSPECTIVE || cam.type == CAMERA_ORTHOGRAPHIC);
++  }
++
+   if (denoiser_->denoise_buffer(render_state_.effective_big_tile_params,
+                                 buffer_to_denoise,
+                                 get_num_samples_in_buffer(),
+diff --git a/intern/cycles/scene/film.cpp b/intern/cycles/scene/film.cpp
+index dde98762..708f99f2 100644
+--- a/intern/cycles/scene/film.cpp
++++ b/intern/cycles/scene/film.cpp
+@@ -542,6 +542,12 @@ void Film::update_passes(Scene *scene)
+     if (integrator->get_use_denoise_pass_albedo()) {
+       add_auto_pass(scene, PASS_DENOISING_ALBEDO);
+     }
++    /* DLSS 5 NR reprojects motion from depth, so it needs the depth pass to
++     * exist. The viewport builds a minimal pass set and does not carry it
++     * otherwise, which is exactly where reprojection is worth having. */
++    if (integrator->get_use_denoise_pass_depth()) {
++      add_auto_pass(scene, PASS_DEPTH);
++    }
+   }
+ 
+   /* Create passes for shadow catcher. */
 diff --git a/intern/cycles/scene/integrator.cpp b/intern/cycles/scene/integrator.cpp
-index eef15d07..0e8f44c9 100644
+index eef15d07..5dab0856 100644
 --- a/intern/cycles/scene/integrator.cpp
 +++ b/intern/cycles/scene/integrator.cpp
 @@ -136,6 +136,7 @@ NODE_DEFINE(Integrator)
@@ -807,7 +929,15 @@ index eef15d07..0e8f44c9 100644
  
    static NodeEnum denoiser_prefilter_enum;
    denoiser_prefilter_enum.insert("none", DENOISER_PREFILTER_NONE);
-@@ -162,6 +163,13 @@ NODE_DEFINE(Integrator)
+@@ -155,6 +156,7 @@ NODE_DEFINE(Integrator)
+   SOCKET_INT(denoise_start_sample, "Start Sample to Denoise", 0);
+   SOCKET_BOOLEAN(use_denoise_pass_albedo, "Use Albedo Pass for Denoiser", true);
+   SOCKET_BOOLEAN(use_denoise_pass_normal, "Use Normal Pass for Denoiser", true);
++  SOCKET_BOOLEAN(use_denoise_pass_depth, "Use Depth Pass for Denoiser", false);
+   SOCKET_ENUM(denoiser_prefilter,
+               "Denoiser Prefilter",
+               denoiser_prefilter_enum,
+@@ -162,6 +164,13 @@ NODE_DEFINE(Integrator)
    SOCKET_BOOLEAN(denoise_use_gpu, "Denoise on GPU", true);
    SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
  
@@ -821,7 +951,7 @@ index eef15d07..0e8f44c9 100644
    return type;
  }
  
-@@ -458,6 +466,13 @@ DenoiseParams Integrator::get_denoise_params() const
+@@ -458,6 +467,13 @@ DenoiseParams Integrator::get_denoise_params() const
    denoise_params.prefilter = denoiser_prefilter;
    denoise_params.quality = denoiser_quality;
  
@@ -836,10 +966,15 @@ index eef15d07..0e8f44c9 100644
  }
  
 diff --git a/intern/cycles/scene/integrator.h b/intern/cycles/scene/integrator.h
-index 0672250a..2cc623a4 100644
+index 0672250a..e5fa039d 100644
 --- a/intern/cycles/scene/integrator.h
 +++ b/intern/cycles/scene/integrator.h
-@@ -104,6 +104,13 @@ class Integrator : public Node {
+@@ -100,10 +100,18 @@ class Integrator : public Node {
+   NODE_SOCKET_API(int, denoise_start_sample);
+   NODE_SOCKET_API(bool, use_denoise_pass_albedo);
+   NODE_SOCKET_API(bool, use_denoise_pass_normal);
++  NODE_SOCKET_API(bool, use_denoise_pass_depth);
+   NODE_SOCKET_API(DenoiserPrefilter, denoiser_prefilter);
    NODE_SOCKET_API(bool, denoise_use_gpu);
    NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
  

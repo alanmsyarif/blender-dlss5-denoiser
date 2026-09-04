@@ -24,6 +24,11 @@ class DLSS5NRDenoiser final : public Denoiser {
 
   static bool is_device_supported(const DeviceInfo &device);
 
+  void set_camera(const ProjectionTransform &worldtoraster,
+                  const ProjectionTransform &rastertocamera,
+                  const Transform &cameratoworld,
+                  bool can_reproject) override;
+
  protected:
   uint get_device_type_mask() const override;
 
@@ -79,9 +84,20 @@ class DLSS5NRDenoiser final : public Denoiser {
    * the first call reports even when guides are absent: that is precisely
    * the case where the user needs to be told why nothing is accumulating. */
   int guides_logged_ = -1;
+
+  /* Camera for this evaluation, and the one from the previous evaluation.
+   * Motion vectors are the difference between where a point lands now and
+   * where it landed then, so the previous frame is the whole state this
+   * denoiser has to carry. */
+  ProjectionTransform worldtoraster_;
+  ProjectionTransform rastertocamera_;
+  Transform cameratoworld_;
+  ProjectionTransform previous_worldtoraster_;
+  bool can_reproject_ = false;
+  bool has_previous_camera_ = false;
   /* Report the actual guide ranges once, so a plausible looking but useless
    * depth or an all zero motion field cannot hide. */
-  bool guide_stats_logged_ = false;
+  int guide_stats_logged_ = 0;
   int width_ = 0;
   int height_ = 0;
 };

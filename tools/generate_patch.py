@@ -439,6 +439,86 @@ def get_effective_preview_denoiser(context, has_oidn_gpu):''',
         '    layout.prop(cscene, "dlss5nr_intensity", text="Intensity")\n',
     )
 
+    # Reprojected motion vectors for the viewport. PASS_MOTION describes motion
+    # between animation frames, so it is zero on a still render and zero in the
+    # viewport, where the frame never changes. Reprojecting from depth and the
+    # camera gives motion between denoiser evaluations instead, which is what a
+    # temporal model accumulates along.
+    replace(
+        root / "intern/cycles/integrator/denoiser.h",
+        '#include "device/denoise.h"\n',
+        '#include "device/denoise.h"\n#include "util/projection.h"\n',
+    )
+    replace(
+        root / "intern/cycles/integrator/denoiser.h",
+        "  virtual bool denoise_buffer(const BufferParams &buffer_params,\n",
+        """  /* Camera state for this evaluation. Only a denoiser that reprojects between
+   * frames needs it, so the base ignores it. Passed as plain transforms rather
+   * than the kernel camera so this header keeps out of kernel types. */
+  virtual void set_camera(const ProjectionTransform & /*worldtoraster*/,
+                          const ProjectionTransform & /*rastertocamera*/,
+                          const Transform & /*cameratoworld*/,
+                          bool /*can_reproject*/)
+  {
+  }
+
+  virtual bool denoise_buffer(const BufferParams &buffer_params,
+""",
+    )
+    replace(
+        root / "intern/cycles/integrator/path_trace.cpp",
+        "  if (denoiser_->denoise_buffer(render_state_.effective_big_tile_params,\n",
+        """  /* Reprojection needs to know where the camera is now; the denoiser remembers
+   * where it was. Only perspective and orthographic cameras have the raster
+   * mapping this depends on. */
+  {
+    const KernelCamera &cam = device_scene_->data.cam;
+    denoiser_->set_camera(cam.worldtoraster,
+                          cam.rastertocamera,
+                          cam.cameratoworld,
+                          cam.type == CAMERA_PERSPECTIVE || cam.type == CAMERA_ORTHOGRAPHIC);
+  }
+
+  if (denoiser_->denoise_buffer(render_state_.effective_big_tile_params,
+""",
+    )
+    replace(
+        root / "intern/cycles/scene/integrator.h",
+        "  NODE_SOCKET_API(bool, use_denoise_pass_normal);\n",
+        "  NODE_SOCKET_API(bool, use_denoise_pass_normal);\n"
+        "  NODE_SOCKET_API(bool, use_denoise_pass_depth);\n",
+    )
+    replace(
+        integrator_cpp,
+        '  SOCKET_BOOLEAN(use_denoise_pass_normal, "Use Normal Pass for Denoiser", true);\n',
+        '  SOCKET_BOOLEAN(use_denoise_pass_normal, "Use Normal Pass for Denoiser", true);\n'
+        '  SOCKET_BOOLEAN(use_denoise_pass_depth, "Use Depth Pass for Denoiser", false);\n',
+    )
+    replace(
+        root / "intern/cycles/scene/film.cpp",
+        """    if (integrator->get_use_denoise_pass_albedo()) {
+      add_auto_pass(scene, PASS_DENOISING_ALBEDO);
+    }
+""",
+        """    if (integrator->get_use_denoise_pass_albedo()) {
+      add_auto_pass(scene, PASS_DENOISING_ALBEDO);
+    }
+    /* DLSS 5 NR reprojects motion from depth, so it needs the depth pass to
+     * exist. The viewport builds a minimal pass set and does not carry it
+     * otherwise, which is exactly where reprojection is worth having. */
+    if (integrator->get_use_denoise_pass_depth()) {
+      add_auto_pass(scene, PASS_DEPTH);
+    }
+""",
+    )
+    replace(
+        sync_cpp,
+        "    integrator->set_use_denoise_pass_normal(denoise_params.use_pass_normal);\n",
+        "    integrator->set_use_denoise_pass_normal(denoise_params.use_pass_normal);\n"
+        "    /* Only DLSS 5 NR consumes depth, and asking for it costs a pass. */\n"
+        "    integrator->set_use_denoise_pass_depth(denoise_params.type == DENOISER_DLSS5NR);\n",
+    )
+
     subprocess.run(
         [
             "git",

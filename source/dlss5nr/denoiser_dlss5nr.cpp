@@ -43,6 +43,17 @@ bool DLSS5NRDenoiser::is_device_supported(const DeviceInfo &device)
 #endif
 }
 
+void DLSS5NRDenoiser::set_camera(const ProjectionTransform &worldtoraster,
+                                 const ProjectionTransform &rastertocamera,
+                                 const Transform &cameratoworld,
+                                 const bool can_reproject)
+{
+  worldtoraster_ = worldtoraster;
+  rastertocamera_ = rastertocamera;
+  cameratoworld_ = cameratoworld;
+  can_reproject_ = can_reproject;
+}
+
 bool DLSS5NRDenoiser::ensure_runtime()
 {
 #ifdef _WIN32
@@ -182,22 +193,25 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
    * adaptive sampling the count is per pixel, not the scene-wide num_samples. */
   const int sample_count_offset = buffer_params.get_pass_offset(PASS_SAMPLE_COUNT);
 
-  /* Guides are opportunistic. Cycles only carries these passes when the view
-   * layer asks for them, so a render without the Z and Vector passes gets the
-   * colour only path and an evaluate that resets every frame. With both present
-   * the model has frame to frame correspondence and can accumulate, which is
-   * what Ray Reconstruction is built around. */
+  /* Motion is reprojected from depth and the camera rather than read from
+   * PASS_MOTION. That pass describes motion between animation frames: on a still
+   * render the previous and next frames are the current one, so every vector is
+   * zero, and the viewport never changes frame at all. Measured, a still render
+   * reported motion mean |v| 0 max 0 where an animated frame reported 18.9.
+   *
+   * Reprojection describes motion between denoiser evaluations instead, which is
+   * what the model accumulates along. It covers camera movement only: an object
+   * moving while the camera holds still is not represented, because nothing in
+   * the depth buffer says it moved. */
   const int depth_offset = buffer_params.get_pass_offset(PASS_DEPTH);
-  const int motion_offset = buffer_params.get_pass_offset(PASS_MOTION);
-  const int motion_weight_offset = buffer_params.get_pass_offset(PASS_MOTION_WEIGHT);
   const bool use_guides = process_guided_ != nullptr && depth_offset != PASS_UNUSED &&
-                          motion_offset != PASS_UNUSED;
+                          can_reproject_;
   if (guides_logged_ != int(use_guides)) {
     guides_logged_ = int(use_guides);
     LOG_INFO << "DLSS 5 NR guides "
              << (use_guides ? "active: depth and motion, temporal accumulation on" :
                               "absent: colour only, resetting every frame. Enable the "
-                              "Z and Vector passes for temporal accumulation");
+                              "Z pass for reprojected motion");
   }
 
   render_buffers->copy_from_device();
@@ -234,24 +248,36 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
          * and at 1024 samples it would have been indistinguishable from an
          * empty buffer. */
         depth[image_index] = pixels[buffer_index + depth_offset];
-        /* The motion pass is accumulated against its own weight rather than the
-         * sample count, which is what divide_type on PASS_MOTION means. Only the
-         * first two components are used: they are the vector back to where this
-         * pixel was in the previous frame, which is the correspondence the model
-         * needs. The last two point at the next frame and are for vector blur. */
-        float motion_scale = inv_scale;
-        if (motion_weight_offset != PASS_UNUSED) {
-          const float weight = pixels[buffer_index + motion_weight_offset];
-          motion_scale = weight > 0.0f ? 1.0f / weight : 0.0f;
+        /* Take the pixel centre back out along its camera ray to the recorded
+         * depth, into the world, then into where the previous evaluation's
+         * camera would have put it. The difference is the vector the model
+         * wants: where this pixel was last time. */
+        float motion_x = 0.0f;
+        float motion_y = 0.0f;
+        if (has_previous_camera_ && depth[image_index] > 0.0f) {
+          const float3 raster = make_float3(float(buffer_params.full_x + x) + 0.5f,
+                                            float(buffer_params.full_y + y) + 0.5f,
+                                            0.0f);
+          const float3 camera_point = transform_perspective(&rastertocamera_, raster);
+          if (camera_point.z != 0.0f) {
+            const float3 at_depth = camera_point * (depth[image_index] / camera_point.z);
+            const float3 world = transform_point(&cameratoworld_, at_depth);
+            const float3 previous = transform_perspective(&previous_worldtoraster_, world);
+            motion_x = previous.x - raster.x;
+            motion_y = previous.y - raster.y;
+          }
         }
-        motion[image_index * 2 + 0] = pixels[buffer_index + motion_offset + 0] * motion_scale;
-        motion[image_index * 2 + 1] = pixels[buffer_index + motion_offset + 1] * motion_scale;
+        motion[image_index * 2 + 0] = motion_x;
+        motion[image_index * 2 + 1] = motion_y;
       }
     }
   }
 
-    if (use_guides && !guide_stats_logged_) {
-    guide_stats_logged_ = true;
+  /* Report once at the start, and again the first time the camera actually
+   * moves. The first evaluation always has nothing to reproject from, so
+   * reporting only there would show a zero motion field however well
+   * reprojection works. */
+  if (use_guides && guide_stats_logged_ < 2) {
     float dmin = depth.empty() ? 0.0f : depth[0];
     float dmax = dmin;
     for (const float d : depth) {
@@ -264,13 +290,17 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
       mmax = std::max(mmax, std::fabs(m));
       msum += std::fabs(m);
     }
-    LOG_INFO << "DLSS 5 NR guide stats: depth " << dmin << " to " << dmax
-             << ", motion mean |v| " << (motion.empty() ? 0.0 : msum / motion.size())
-             << " max " << mmax;
+    if (guide_stats_logged_ == 0 || mmax > 0.0f) {
+      guide_stats_logged_ = (mmax > 0.0f) ? 2 : 1;
+      LOG_INFO << "DLSS 5 NR guide stats: depth " << dmin << " to " << dmax
+               << ", motion mean |v| " << (motion.empty() ? 0.0 : msum / motion.size())
+               << " max " << mmax;
+    }
   }
 
 char error[1024] = {};
-  const bool reset = width_ != buffer_params.width || height_ != buffer_params.height;
+  const bool reset = width_ != buffer_params.width || height_ != buffer_params.height ||
+                     (use_guides && !has_previous_camera_);
   const int ok = use_guides ? process_guided_(input.data(),
                                              output.data(),
                                              depth.data(),
@@ -314,6 +344,10 @@ char error[1024] = {};
   }
   width_ = buffer_params.width;
   height_ = buffer_params.height;
+  if (use_guides) {
+    previous_worldtoraster_ = worldtoraster_;
+    has_previous_camera_ = true;
+  }
 
   for (int y = 0; y < buffer_params.height; ++y) {
     for (int x = 0; x < buffer_params.width; ++x) {

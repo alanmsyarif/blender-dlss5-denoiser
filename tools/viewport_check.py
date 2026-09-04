@@ -71,6 +71,11 @@ def setup(denoiser: str) -> None:
             raise SystemExit(f"Cycles resolved preview_denoiser to {scene.cycles.preview_denoiser}")
     print("VIEWPORT preview_denoiser:", scene.cycles.preview_denoiser)
 
+    # Reprojected motion is derived from depth, so the denoiser needs the Z
+    # pass present in the viewport buffers to do anything temporal.
+    bpy.context.view_layer.use_pass_z = True
+    print("VIEWPORT use_pass_z:", bpy.context.view_layer.use_pass_z)
+
     # Bright enough to exercise the HDR staging path, as in denoise_compare.py.
     material = bpy.data.materials.new("Emit")
     tree = material.node_tree
