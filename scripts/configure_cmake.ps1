@@ -82,15 +82,33 @@ if ($OptixRoot) {
     '-DWITH_CYCLES_DEVICE_CUDA=ON',
     "-DOPTIX_ROOT_DIR=$OptixRoot"
   )
+  # Kernel binaries decide whether Cycles offers the GPU at all, not just how
+  # fast it renders: device_cuda_init refuses the device unless it finds either
+  # precompiled kernels or a CUDA compiler, so with this OFF the denoiser list
+  # comes back empty and nothing explains why.
+  $cmakeArgs += '-DWITH_CYCLES_CUDA_BINARIES=ON'
+
   if ($CudaArch) {
     # Blender defaults to ten architectures, each a full megakernel nvcc run.
-    # Building only the one this machine uses turns hours into minutes. Note
-    # CUDA 13 dropped Maxwell and Pascal, so the default list fails outright
-    # there; naming an architecture avoids that too.
-    $cmakeArgs += @(
-      '-DWITH_CYCLES_CUDA_BINARIES=ON',
-      "-DCYCLES_CUDA_BINARIES_ARCH=$CudaArch"
-    )
+    # Building only the one this machine uses turns hours into minutes.
+    $cmakeArgs += "-DCYCLES_CUDA_BINARIES_ARCH=$CudaArch"
+  }
+  else {
+    # An empty architecture list builds the OptiX PTX kernels and no CUDA
+    # cubins, because the cubin loop is a plain foreach over this variable
+    # while the OptiX block only tests WITH_CYCLES_CUDA_BINARIES.
+    #
+    # That is the combination that works on a CUDA 13 toolkit. Blender pins
+    # CUDA 12.8 (build_files/config/pipeline_config.yaml) and warns for
+    # anything outside 10.1, 10.2, 11.x and 12.x; on 13.3 the megakernel dies
+    # in NVVM with "Attribute after last parameter!" then "input module is
+    # broken!". The OptiX PTX path is different: Blender handles CUDA 13 there
+    # explicitly, falling back to compute_75.
+    #
+    # The cost is that only OptiX can render. The CUDA device still enumerates
+    # but has no kernels of its own. Pass -CudaArch with a CUDA 12.x toolkit
+    # to get cubins as well.
+    $cmakeArgs += '-DCYCLES_CUDA_BINARIES_ARCH='
   }
 }
 
