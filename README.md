@@ -2,6 +2,51 @@
 
 This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5 NR (Experimental)** denoiser for final renders and rendered viewport updates. It uses the undocumented dynamic NGX ABI approach from [ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR), not NVIDIA's official DLSS/Streamline SDK.
 
+## Status: this targets the wrong runtime
+
+This project drives `nvngx_dlssnr.dll`, NGX feature 18, over a D3D12 bridge with
+CPU staging and a Reinhard tonemap. It works, it is measured, and it is the wrong
+choice for a Cycles denoiser. Anyone continuing this should read this section
+before writing code.
+
+Feature 18 is an appearance model. Its 61 parameters cover Style, Intensity,
+Tone, Structure, Skin, AutoMask and UI compositing. It has no albedo, normal,
+roughness or hit distance inputs, which is to say none of the guides a denoiser
+needs. Measured on `build/blender/tests/human_test.blend` at 16 samples against a
+512 sample reference:
+
+```text
+OptiX          3.46% RMSE
+undenoised     9.19%
+this project  25.13%   keeping 85% of reference highlights
+```
+
+It moves the image away from the converged result. That is not a tuning problem.
+
+The right target is `nvngx_dlssd.dll`, product name "NVIDIA DLSS Ray
+Reconstruction", driven through the **CUDA** NGX entry points
+(`NVSDK_NGX_CUDA_Init_Ext1`, `CreateFeature1`, `AllocateParameters`,
+`EvaluateFeature`, `ReleaseFeature`, `Shutdown1`). That runs on Cycles' own
+device buffers: no D3D12 device, no CPU round trip, no tonemapping, no FP16
+staging. Its parameters are what a path tracer denoiser actually wants, including
+`DiffuseHitDistance`, `SpecularHitDistance`, diffuse and specular ray directions,
+`ReflectedAlbedo` and a `ScreenSpaceSubsurfaceScatteringGuide`, on top of the
+albedo, normal and roughness guides Cycles already produces for OptiX and
+OpenImageDenoise.
+
+A working build proving this exists and denoises the viewport in real time
+without jitter.
+
+Most of the Cycles side here survives such a rewrite: the denoiser class and its
+registration, the UI properties, the pass plumbing, and the camera reprojection
+that derives motion vectors between evaluations. What deletes is most of
+`source/dlss5nr/dlss5nr_bridge.cpp`.
+
+The D3D12 approach was inherited from ComfyUI-DLSS5-NR, an image processing tool
+where it is the sensible design. Every defect fixed in this repository's history,
+highlight crushing, the tonemap knee, zero motion vectors and the per frame CPU
+round trip, is downstream of carrying that design into a renderer.
+
 ## Important limitations
 
 - Windows x64 and NVIDIA RTX only. RTX 20 and non-RTX are not supported; Ada and Blackwell are the primary targets and Ampere is slow.
