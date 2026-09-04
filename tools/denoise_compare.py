@@ -77,7 +77,6 @@ def build_scene(device: str, samples: int, denoiser: str) -> None:
     bpy.ops.object.shade_smooth()
 
     material = bpy.data.materials.new("Emit")
-    material.use_nodes = True
     tree = material.node_tree
     tree.nodes.clear()
     emission = tree.nodes.new("ShaderNodeEmission")

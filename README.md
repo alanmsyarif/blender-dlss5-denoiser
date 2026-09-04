@@ -98,6 +98,23 @@ It refuses a GPU comparison without an OptiX device, because Cycles otherwise
 falls back to the CPU and off DLSS 5 NR silently, which looks indistinguishable
 from a denoiser that ran and changed nothing.
 
+Viewport denoising is not reachable from a background render, and every bug this
+project has hit in the denoiser's lifetime showed up only under the viewport's
+calling pattern: repeated invocations, view changes, and resolution changes
+mid-session. This drives a real rendered viewport and quits by itself, so run it
+without `-b`:
+
+```powershell
+.\build\blender\bin\blender.exe --factory-startup --debug-cycles -P tools\viewport_check.py
+```
+
+A clean run ends with `VIEWPORT_CHECK_DONE ... failures=0`. Also grep the output
+for `EXCEPTION_ACCESS_VIOLATION`, `DEVICE_HUNG` and `Could not create a D3D12
+device`: those are the three ways this has broken before, and none of them stop
+the session on their own. What it cannot judge is whether the result looks
+stable, since with cleared depth and motion guides the model denoises each frame
+independently and any flicker has to be seen.
+
 Windows RTX smoke test:
 
 1. Start patched Blender from shell containing both runtime environment variables.
