@@ -28,7 +28,7 @@ index e7b77090..e253e335 100644
    add_definitions(-DWITH_CYCLES_STANDALONE_GUI)
  endif()
 diff --git a/intern/cycles/blender/addon/properties.py b/intern/cycles/blender/addon/properties.py
-index a37d057a..a1ba6149 100644
+index a37d057a..fe2a0917 100644
 --- a/intern/cycles/blender/addon/properties.py
 +++ b/intern/cycles/blender/addon/properties.py
 @@ -270,6 +270,13 @@ def enum_openimagedenoise_denoiser(self, context):
@@ -61,7 +61,7 @@ index a37d057a..a1ba6149 100644
      items += enum_optix_denoiser(self, context)
      items += enum_openimagedenoise_denoiser(self, context)
      return items
-@@ -403,6 +412,43 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
+@@ -403,6 +412,52 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
          default=True,
          update=update_render_passes,
      )
@@ -74,6 +74,15 @@ index a37d057a..a1ba6149 100644
 +            ('CINEMATIC', "Cinematic", "Cinematic reconstruction", 2),
 +        ),
 +        default='NATURAL',
++    )
++    dlss5nr_intensity: FloatProperty(
++        name="Intensity",
++        description=(
++            "Strength of the DLSS 5 neural rendering effect. The runtime clamps "
++            "this at 1.0, so values above it change nothing; 0.0 turns the "
++            "effect off and leaves the reconstruction alone"
++        ),
++        min=0.0, max=1.0, default=1.0,
 +    )
 +    dlss5nr_tone: FloatProperty(
 +        name="Tone",
@@ -106,10 +115,10 @@ index a37d057a..a1ba6149 100644
          name="Denoiser",
          description="Denoise the image with the selected denoiser. "
 diff --git a/intern/cycles/blender/addon/ui.py b/intern/cycles/blender/addon/ui.py
-index d4085ed1..2dcb177a 100644
+index d4085ed1..75c1949e 100644
 --- a/intern/cycles/blender/addon/ui.py
 +++ b/intern/cycles/blender/addon/ui.py
-@@ -170,6 +170,18 @@ def show_denoise_active(context):
+@@ -170,6 +170,19 @@ def show_denoise_active(context):
      return True
  
  
@@ -117,6 +126,7 @@ index d4085ed1..2dcb177a 100644
 +    # Skin is only meaningful once the model is classifying the image, so it is
 +    # greyed out rather than hidden: hiding it makes the dependency invisible.
 +    layout.prop(cscene, "dlss5nr_style", text="Style")
++    layout.prop(cscene, "dlss5nr_intensity", text="Intensity")
 +    layout.prop(cscene, "dlss5nr_tone", text="Tone")
 +    layout.prop(cscene, "dlss5nr_structure", text="Structure")
 +    layout.prop(cscene, "dlss5nr_auto_mask", text="Auto Mask")
@@ -128,7 +138,7 @@ index d4085ed1..2dcb177a 100644
  def get_effective_preview_denoiser(context, has_oidn_gpu):
      scene = context.scene
      cscene = scene.cycles
-@@ -277,6 +289,9 @@ class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
+@@ -277,6 +290,9 @@ class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
              col.prop(cscene, "preview_denoising_prefilter", text="Prefilter")
              col.prop(cscene, "preview_denoising_quality", text="Quality")
  
@@ -138,7 +148,7 @@ index d4085ed1..2dcb177a 100644
          col.prop(cscene, "preview_denoising_start_sample", text="Start Sample")
  
          if effective_preview_denoiser == 'OPENIMAGEDENOISE':
-@@ -344,6 +359,8 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
+@@ -344,6 +360,8 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
          sub.prop(cscene, "denoiser", text="Denoiser")
  
          col.prop(cscene, "denoising_input_passes", text="Passes")
@@ -165,15 +175,16 @@ index 7468bb03..9e4c54ce 100644
      PyModule_AddObjectRef(mod, "with_openimagedenoise", Py_True);
    }
 diff --git a/intern/cycles/blender/sync.cpp b/intern/cycles/blender/sync.cpp
-index 239b234d..c7f236ec 100644
+index 239b234d..c1074fe1 100644
 --- a/intern/cycles/blender/sync.cpp
 +++ b/intern/cycles/blender/sync.cpp
-@@ -540,6 +540,12 @@ void BlenderSync::sync_integrator(BL::ViewLayer &b_view_layer,
+@@ -540,6 +540,13 @@ void BlenderSync::sync_integrator(BL::ViewLayer &b_view_layer,
      integrator->set_use_denoise_pass_normal(denoise_params.use_pass_normal);
      integrator->set_denoiser_prefilter(denoise_params.prefilter);
      integrator->set_denoiser_quality(denoise_params.quality);
 +
 +    integrator->set_dlss5nr_style(denoise_params.dlss5nr_style);
++    integrator->set_dlss5nr_intensity(denoise_params.dlss5nr_intensity);
 +    integrator->set_dlss5nr_tone(denoise_params.dlss5nr_tone);
 +    integrator->set_dlss5nr_structure(denoise_params.dlss5nr_structure);
 +    integrator->set_dlss5nr_skin(denoise_params.dlss5nr_skin);
@@ -181,7 +192,7 @@ index 239b234d..c7f236ec 100644
    }
  
    /* UPDATE_NONE as we don't want to tag the integrator as modified (this was done by the
-@@ -1035,6 +1041,15 @@ DenoiseParams BlenderSync::get_denoise_params(BL::Scene &b_scene,
+@@ -1035,6 +1042,16 @@ DenoiseParams BlenderSync::get_denoise_params(BL::Scene &b_scene,
  
    int input_passes = -1;
  
@@ -189,6 +200,7 @@ index 239b234d..c7f236ec 100644
 +   * describe how the model should treat the image, not how much time to spend,
 +   * so splitting them per context would only invite the two to disagree. */
 +  denoising.dlss5nr_style = get_int(cscene, "dlss5nr_style");
++  denoising.dlss5nr_intensity = get_float(cscene, "dlss5nr_intensity");
 +  denoising.dlss5nr_tone = get_float(cscene, "dlss5nr_tone");
 +  denoising.dlss5nr_structure = get_float(cscene, "dlss5nr_structure");
 +  denoising.dlss5nr_skin = get_float(cscene, "dlss5nr_skin");
@@ -198,7 +210,7 @@ index 239b234d..c7f236ec 100644
      /* Final Render Denoising */
      denoising.use = get_boolean(cscene, "use_denoising");
 diff --git a/intern/cycles/device/denoise.cpp b/intern/cycles/device/denoise.cpp
-index 3833a121..ac01c776 100644
+index 3833a121..319f1b9c 100644
 --- a/intern/cycles/device/denoise.cpp
 +++ b/intern/cycles/device/denoise.cpp
 @@ -13,6 +13,8 @@ const char *denoiserTypeToHumanReadable(DenoiserType type)
@@ -218,11 +230,12 @@ index 3833a121..ac01c776 100644
    }
  
    return &type_enum;
-@@ -83,6 +86,12 @@ NODE_DEFINE(DenoiseParams)
+@@ -83,6 +86,13 @@ NODE_DEFINE(DenoiseParams)
    SOCKET_ENUM(prefilter, "Prefilter", *prefilter_enum, DENOISER_PREFILTER_FAST);
    SOCKET_ENUM(quality, "Quality", *quality_enum, DENOISER_QUALITY_HIGH);
  
 +  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);
++  SOCKET_FLOAT(dlss5nr_intensity, "DLSS5 NR Intensity", 1.0f);
 +  SOCKET_FLOAT(dlss5nr_tone, "DLSS5 NR Tone", 1.0f);
 +  SOCKET_FLOAT(dlss5nr_structure, "DLSS5 NR Structure", 1.0f);
 +  SOCKET_FLOAT(dlss5nr_skin, "DLSS5 NR Skin", -1.0f);
@@ -232,7 +245,7 @@ index 3833a121..ac01c776 100644
  }
  
 diff --git a/intern/cycles/device/denoise.h b/intern/cycles/device/denoise.h
-index e907b8af..42af3cf2 100644
+index e907b8af..9bbc5c48 100644
 --- a/intern/cycles/device/denoise.h
 +++ b/intern/cycles/device/denoise.h
 @@ -11,6 +11,7 @@ CCL_NAMESPACE_BEGIN
@@ -243,7 +256,7 @@ index e907b8af..42af3cf2 100644
    DENOISER_NUM,
  
    DENOISER_NONE = 0,
-@@ -75,6 +76,18 @@ class DenoiseParams : public Node {
+@@ -75,6 +76,19 @@ class DenoiseParams : public Node {
    DenoiserPrefilter prefilter = DENOISER_PREFILTER_FAST;
    DenoiserQuality quality = DENOISER_QUALITY_HIGH;
  
@@ -253,6 +266,7 @@ index e907b8af..42af3cf2 100644
 +   * nothing unless auto_mask is on, because the mask is what gives the model
 +   * something material specific to act on. */
 +  int dlss5nr_style = 1;
++  float dlss5nr_intensity = 1.0f;
 +  float dlss5nr_tone = 1.0f;
 +  float dlss5nr_structure = 1.0f;
 +  /* Negative leaves the model's own default alone. */
@@ -348,10 +362,10 @@ index b5791118..a94a9b20 100644
        return make_unique<OptiXDenoiser>(single_denoiser_device, effective_denoiser_params);
 diff --git a/intern/cycles/integrator/denoiser_dlss5nr.cpp b/intern/cycles/integrator/denoiser_dlss5nr.cpp
 new file mode 100644
-index 00000000..322af543
+index 00000000..53f7e471
 --- /dev/null
 +++ b/intern/cycles/integrator/denoiser_dlss5nr.cpp
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,307 @@
 +/* SPDX-FileCopyrightText: 2026 Blender DLSS5 NR contributors
 + *
 + * SPDX-License-Identifier: Apache-2.0 */
@@ -606,7 +620,7 @@ index 00000000..322af543
 +                                             buffer_params.height,
 +                                             params_.dlss5nr_style,
 +                                             0,
-+                                             1.0f,
++                                             params_.dlss5nr_intensity,
 +                                             params_.dlss5nr_tone,
 +                                             params_.dlss5nr_structure,
 +                                             params_.dlss5nr_skin,
@@ -619,13 +633,11 @@ index 00000000..322af543
 +                buffer_params.width,
 +                buffer_params.height,
 +                params_.dlss5nr_style,
-+                /* Preset and intensity are passed at their defaults because
-+                 * both measured as exactly no change against the runtime: for
-+                 * every value tried the output was bit identical, so either
-+                 * those parameter names are wrong or the runtime ignores them.
-+                 * There is nothing to expose until that is understood. */
-+                0,    /* preset */
-+                1.0f, /* intensity */
++                /* Preset is passed at its default because every value across
++                 * its whole 0..3 range produced bit identical output, so either
++                 * the parameter name is wrong or the runtime ignores it. */
++                0, /* preset */
++                params_.dlss5nr_intensity,
 +                params_.dlss5nr_tone,
 +                params_.dlss5nr_structure,
 +                /* Negative leaves the model default alone, and skin only does
@@ -754,7 +766,7 @@ index 00000000..5ec20f65
 +
 +CCL_NAMESPACE_END
 diff --git a/intern/cycles/scene/integrator.cpp b/intern/cycles/scene/integrator.cpp
-index eef15d07..e61a2007 100644
+index eef15d07..0e8f44c9 100644
 --- a/intern/cycles/scene/integrator.cpp
 +++ b/intern/cycles/scene/integrator.cpp
 @@ -136,6 +136,7 @@ NODE_DEFINE(Integrator)
@@ -765,11 +777,12 @@ index eef15d07..e61a2007 100644
  
    static NodeEnum denoiser_prefilter_enum;
    denoiser_prefilter_enum.insert("none", DENOISER_PREFILTER_NONE);
-@@ -162,6 +163,12 @@ NODE_DEFINE(Integrator)
+@@ -162,6 +163,13 @@ NODE_DEFINE(Integrator)
    SOCKET_BOOLEAN(denoise_use_gpu, "Denoise on GPU", true);
    SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
  
 +  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);
++  SOCKET_FLOAT(dlss5nr_intensity, "DLSS5 NR Intensity", 1.0f);
 +  SOCKET_FLOAT(dlss5nr_tone, "DLSS5 NR Tone", 1.0f);
 +  SOCKET_FLOAT(dlss5nr_structure, "DLSS5 NR Structure", 1.0f);
 +  SOCKET_FLOAT(dlss5nr_skin, "DLSS5 NR Skin", -1.0f);
@@ -778,11 +791,12 @@ index eef15d07..e61a2007 100644
    return type;
  }
  
-@@ -458,6 +465,12 @@ DenoiseParams Integrator::get_denoise_params() const
+@@ -458,6 +466,13 @@ DenoiseParams Integrator::get_denoise_params() const
    denoise_params.prefilter = denoiser_prefilter;
    denoise_params.quality = denoiser_quality;
  
 +  denoise_params.dlss5nr_style = dlss5nr_style;
++  denoise_params.dlss5nr_intensity = dlss5nr_intensity;
 +  denoise_params.dlss5nr_tone = dlss5nr_tone;
 +  denoise_params.dlss5nr_structure = dlss5nr_structure;
 +  denoise_params.dlss5nr_skin = dlss5nr_skin;
@@ -792,14 +806,15 @@ index eef15d07..e61a2007 100644
  }
  
 diff --git a/intern/cycles/scene/integrator.h b/intern/cycles/scene/integrator.h
-index 0672250a..b03cf17f 100644
+index 0672250a..2cc623a4 100644
 --- a/intern/cycles/scene/integrator.h
 +++ b/intern/cycles/scene/integrator.h
-@@ -104,6 +104,12 @@ class Integrator : public Node {
+@@ -104,6 +104,13 @@ class Integrator : public Node {
    NODE_SOCKET_API(bool, denoise_use_gpu);
    NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
  
 +  NODE_SOCKET_API(int, dlss5nr_style);
++  NODE_SOCKET_API(float, dlss5nr_intensity);
 +  NODE_SOCKET_API(float, dlss5nr_tone);
 +  NODE_SOCKET_API(float, dlss5nr_structure);
 +  NODE_SOCKET_API(float, dlss5nr_skin);

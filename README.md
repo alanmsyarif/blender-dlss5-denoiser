@@ -181,12 +181,9 @@ Controls: `Enabled`, `Reset`, `Width`, `Height`, `ScalingRatio`,
 `Intensity`, `LocalToneStrength`, `LocalStructureStrength`,
 `SkinStructureStrength`, `UseAutoMask`, `UICorrection`.
 
-That is a denoiser with appearance controls and a UI compositing path. There is
-no parameter for generative lighting, indirect or bounced light, scene semantics,
-hair or fabric. Whatever those product descriptions refer to, this feature does
-not expose it, so it is not something this project has failed to switch on. Ray
-Reconstruction reconstructs lighting from the samples the renderer traced; it
-does not add light that was never traced.
+There is no separately named parameter for lighting, semantics, hair or fabric.
+Those are not switches; they are what the model does with the frame, steered by
+the controls above. See "Generative neural rendering" below.
 
 Names this project sets that the runtime does not contain, and which therefore
 did nothing: `OutWidth`, `OutHeight`, `DLSSNR.InputWidth`, `DLSSNR.InputHeight`,
@@ -220,6 +217,37 @@ Real parameters still unused, each a separate piece of work:
   `UseAutoMask` to classify the frame.
 - `Backbuffer`, `UI` and `UIAlpha` drive the UI compositing path.
 - `BidirectionalDistortionField` handles lens distortion.
+
+## Generative neural rendering
+
+DLSS 5's headline capability, a generative stage that repaints lighting,
+materials and shadowing on the finished frame without touching geometry, is what
+this feature is. "NR" is Neural Rendering, not noise reduction, and the parameter
+surface matches the capability rather than a denoiser: `Intensity` for effect
+strength, `Style` and `LocalToneStrength` for grading, `UseAutoMask` and
+`ControlMask` for restricting where it applies, and `SkinStructureStrength` for
+material specific behaviour.
+
+It is on by default here, at full strength. `Intensity` is the master control:
+
+```text
+intensity 0.00   26.15% different from the default
+intensity 0.25   15.43%
+intensity 0.50    9.14%
+intensity 0.75    4.15%
+intensity 1.00     base
+intensity 1.50    no change, the runtime clamps at 1.0
+```
+
+That was nearly missed. Tested only at 2.0 the parameter looks completely inert,
+because it is above the clamp, and it was written off as ignored on that basis.
+Sweeping the range shows it moving the image monotonically, and at 0.0 the
+generative stage is off. `Hint.Render.Preset` really is inert, verified across
+its whole 0..3 range rather than at one value.
+
+What is not wired up is `ControlMask`, which would let a render restrict the
+effect to chosen regions rather than relying on `UseAutoMask` to classify the
+frame, and `ScalingRatio`.
 
 ## References
 

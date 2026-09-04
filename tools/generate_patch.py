@@ -374,6 +374,71 @@ def get_effective_preview_denoiser(context, has_oidn_gpu):''',
 """,
     )
 
+    # Intensity is the master strength of the neural rendering effect. It was
+    # nearly left out: tested only at 2.0 it looked inert, because the runtime
+    # clamps it at 1.0. Swept across 0 to 1 it moves the image monotonically,
+    # and 0.0 turns the effect off entirely.
+    replace(
+        root / "intern/cycles/device/denoise.h",
+        "  int dlss5nr_style = 1;\n",
+        "  int dlss5nr_style = 1;\n  float dlss5nr_intensity = 1.0f;\n",
+    )
+    replace(
+        root / "intern/cycles/device/denoise.cpp",
+        '  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);\n',
+        '  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);\n'
+        '  SOCKET_FLOAT(dlss5nr_intensity, "DLSS5 NR Intensity", 1.0f);\n',
+    )
+    replace(
+        root / "intern/cycles/scene/integrator.h",
+        "  NODE_SOCKET_API(int, dlss5nr_style);\n",
+        "  NODE_SOCKET_API(int, dlss5nr_style);\n  NODE_SOCKET_API(float, dlss5nr_intensity);\n",
+    )
+    replace(
+        integrator_cpp,
+        '  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);\n',
+        '  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);\n'
+        '  SOCKET_FLOAT(dlss5nr_intensity, "DLSS5 NR Intensity", 1.0f);\n',
+    )
+    replace(
+        integrator_cpp,
+        "  denoise_params.dlss5nr_style = dlss5nr_style;\n",
+        "  denoise_params.dlss5nr_style = dlss5nr_style;\n"
+        "  denoise_params.dlss5nr_intensity = dlss5nr_intensity;\n",
+    )
+    replace(
+        sync_cpp,
+        '  denoising.dlss5nr_style = get_int(cscene, "dlss5nr_style");\n',
+        '  denoising.dlss5nr_style = get_int(cscene, "dlss5nr_style");\n'
+        '  denoising.dlss5nr_intensity = get_float(cscene, "dlss5nr_intensity");\n',
+    )
+    replace(
+        sync_cpp,
+        "    integrator->set_dlss5nr_style(denoise_params.dlss5nr_style);\n",
+        "    integrator->set_dlss5nr_style(denoise_params.dlss5nr_style);\n"
+        "    integrator->set_dlss5nr_intensity(denoise_params.dlss5nr_intensity);\n",
+    )
+    replace(
+        properties,
+        "    dlss5nr_tone: FloatProperty(",
+        '''    dlss5nr_intensity: FloatProperty(
+        name="Intensity",
+        description=(
+            "Strength of the DLSS 5 neural rendering effect. The runtime clamps "
+            "this at 1.0, so values above it change nothing; 0.0 turns the "
+            "effect off and leaves the reconstruction alone"
+        ),
+        min=0.0, max=1.0, default=1.0,
+    )
+    dlss5nr_tone: FloatProperty(''',
+    )
+    replace(
+        ui_py,
+        '    layout.prop(cscene, "dlss5nr_style", text="Style")\n',
+        '    layout.prop(cscene, "dlss5nr_style", text="Style")\n'
+        '    layout.prop(cscene, "dlss5nr_intensity", text="Intensity")\n',
+    )
+
     subprocess.run(
         [
             "git",
