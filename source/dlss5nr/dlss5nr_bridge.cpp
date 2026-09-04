@@ -136,6 +136,13 @@ static ComPtr<ID3D12Resource> g_motion;
 static ComPtr<ID3D12Resource> g_upload;
 static ComPtr<ID3D12Resource> g_readback;
 static constexpr int kMinLongSide = 96;
+
+// Highest linear value handed to us this frame. The inverse tonemap is convex,
+// so a model output near 1.0 reconstructs to an enormous number; clamping the
+// result to a little above what actually went in turns those into bright
+// pixels instead of 2047.8 fireflies that would wreck any bloom or grade.
+static float g_frame_max_in = 0.0f;
+static constexpr float kMaxOvershoot = 1.5f;
 static UINT g_width = 0, g_height = 0, g_row_pitch = 0;
 static UINT64 g_total_bytes = 0;
 // Every parameter the model latches at CreateFeature. Changing any of them has
@@ -233,13 +240,23 @@ static float SrgbToLinear(float c) {
 // Stateless on purpose. An exposure derived from the frame would fit the data
 // better, but it would also change from frame to frame, and this denoiser runs
 // per viewport update, where that reads as flicker.
+// Everything below the knee passes through untouched, so the range a render
+// actually spends most of its pixels in keeps full precision, and only the
+// excess above it is compressed into what is left of [0, 1).
+static constexpr float kKneeStart = 0.8f;
+static constexpr float kKneeScale = 1.0f;
+
 static float TonemapForward(float c) {
     // The negated comparison also rejects NaN, which would otherwise reach the
     // model and come back as a dead pixel.
     if (!(c > 0.0f)) {
         return 0.0f;
     }
-    return c / (1.0f + c);
+    if (c <= kKneeStart) {
+        return c;
+    }
+    const float over = c - kKneeStart;
+    return kKneeStart + (1.0f - kKneeStart) * (over / (over + kKneeScale));
 }
 
 // The largest value FP16 represents below 1.0 is 1 - 2^-11, so the inverse can
@@ -251,8 +268,12 @@ static float TonemapInverse(float c) {
     if (!(c > 0.0f)) {
         return 0.0f;
     }
-    c = std::min(c, kTonemapCeiling);
-    return c / (1.0f - c);
+    if (c <= kKneeStart) {
+        return c;
+    }
+    float over = (c - kKneeStart) / (1.0f - kKneeStart);
+    over = std::min(over, kTonemapCeiling);
+    return kKneeStart + kKneeScale * over / (1.0f - over);
 }
 
 static void SetError(const char* fmt, ...) {
@@ -840,21 +861,35 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     if (!EnsureFeature(static_cast<UINT>(width), static_cast<UINT>(height), params)) {
         CopyError(err, err_cap); return 0;
     }
-    SetEvalParams((reset || rebuilt) ? 1 : 0);
+    // Always reset. This is Ray Reconstruction, so the model accumulates history
+    // across evaluations, but the integration binds cleared depth and motion
+    // guides: there is no correspondence between frames for it to accumulate
+    // along. Letting it try produced a 17% swing in output energy for identical
+    // input across repeated renders, which reads as flicker in the viewport,
+    // while OptiX and OpenImageDenoise are bit-stable on the same scene.
+    //
+    // Once real depth and motion vectors are wired up this should become
+    // (reset || rebuilt) again, and the accumulation is the point of using this
+    // model at all.
+    (void)rebuilt;
+    SetEvalParams(1);
 
     void* mapped = nullptr;
     HRESULT hr = g_upload->Map(0, nullptr, &mapped);
     if (FAILED(hr) || !mapped) { SetError("Upload buffer Map failed: 0x%08X", static_cast<unsigned>(hr)); CopyError(err, err_cap); return 0; }
     memset(mapped, 0, static_cast<size_t>(g_total_bytes));
     auto* dst_base = static_cast<uint8_t*>(mapped);
+    g_frame_max_in = 0.0f;
     for (int y = 0; y < height; ++y) {
         auto* row = reinterpret_cast<uint16_t*>(dst_base + static_cast<size_t>(y) * g_row_pitch);
         const float* src = rgb_in + static_cast<size_t>(y) * width * 3;
         for (int x = 0; x < width; ++x) {
             // The model expects display-referred colour; Cycles hands us linear.
-            row[x * 4 + 0] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 0])));
-            row[x * 4 + 1] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 1])));
-            row[x * 4 + 2] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 2])));
+            for (int ch = 0; ch < 3; ++ch) {
+                const float linear = src[x * 3 + ch];
+                if (linear > g_frame_max_in) g_frame_max_in = linear;
+                row[x * 4 + ch] = FloatToHalf(LinearToSrgb(TonemapForward(linear)));
+            }
             row[x * 4 + 3] = FloatToHalf(1.0f);
         }
     }
@@ -908,9 +943,12 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
             // DLSSNR builds have been observed to produce B,G,R,A while patched
             // Ada builds may produce R,G,B,A. Python selects/auto-detects the
             // correct interpretation instead of hard-coding a swap here.
-            dstf[x * 3 + 0] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 0]), 0.0f, 1.0f)));
-            dstf[x * 3 + 1] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 1]), 0.0f, 1.0f)));
-            dstf[x * 3 + 2] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 2]), 0.0f, 1.0f)));
+            const float ceiling = g_frame_max_in * kMaxOvershoot;
+            for (int ch = 0; ch < 3; ++ch) {
+                const float value = TonemapInverse(
+                    SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + ch]), 0.0f, 1.0f)));
+                dstf[x * 3 + ch] = std::min(value, ceiling);
+            }
         }
     }
     g_readback->Unmap(0, nullptr);

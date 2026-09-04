@@ -13,18 +13,29 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "source/dlss5nr/dlss5nr_bridge.cpp"
 
-# Mirrors kTonemapCeiling in the bridge: the largest value FP16 holds below 1.0.
+# Mirror the bridge's constants: the knee below which colour passes through
+# untouched, and the largest value FP16 holds below 1.0.
 CEILING = 1.0 - 1.0 / 2048.0
+KNEE_START = 0.8
+KNEE_SCALE = 1.0
 
 
 def forward(c):
-    return c / (1.0 + c) if c > 0.0 else 0.0
+    if c <= 0.0:
+        return 0.0
+    if c <= KNEE_START:
+        return c
+    over = c - KNEE_START
+    return KNEE_START + (1.0 - KNEE_START) * (over / (over + KNEE_SCALE))
 
 
 def inverse(c):
     if c <= 0.0:
         return 0.0
-    return min(c, CEILING) / (1.0 - min(c, CEILING))
+    if c <= KNEE_START:
+        return c
+    over = min((c - KNEE_START) / (1.0 - KNEE_START), CEILING)
+    return KNEE_START + KNEE_SCALE * over / (1.0 - over)
 
 
 class TonemapMathTests(unittest.TestCase):
@@ -43,6 +54,13 @@ class TonemapMathTests(unittest.TestCase):
         # A channel the model hands back as exactly 1.0 must not become inf.
         self.assertTrue(0.0 < inverse(1.0) < 4096.0)
 
+    def test_below_the_knee_is_exact(self):
+        # The point of the knee: the range most pixels live in is not resampled
+        # at all, so it costs no precision to carry highlights.
+        for value in (0.0, 0.1, 0.5, 0.79, KNEE_START):
+            self.assertAlmostEqual(forward(value), value, places=6)
+            self.assertAlmostEqual(inverse(forward(value)), value, places=6)
+
     def test_forward_is_monotonic(self):
         values = [forward(v) for v in (0.0, 0.1, 1.0, 10.0, 100.0)]
         self.assertEqual(values, sorted(values))
@@ -53,18 +71,22 @@ class BridgeStagingTests(unittest.TestCase):
         self.source = BRIDGE.read_text(encoding="utf-8")
 
     def test_staging_uses_the_tonemap(self):
-        self.assertIn("TonemapForward(src[x * 3 + 0])", self.source)
+        self.assertIn("LinearToSrgb(TonemapForward(", self.source)
         self.assertIn("TonemapInverse(", self.source)
 
     def test_colour_is_not_clamped_into_0_1_on_the_way_in(self):
-        # The regression this whole file exists to prevent.
+        # The regression this whole file exists to prevent. Matches the clamp
+        # wherever the input comes from, so refactoring the encode loop cannot
+        # quietly retire the guard the way an exact source anchor did.
         self.assertIsNone(
-            re.search(r"LinearToSrgb\(std::clamp\(src\[", self.source),
+            re.search(r"LinearToSrgb\(\s*std::clamp\(", self.source),
             "colour is being clamped to 0..1 again before the model sees it",
         )
 
-    def test_ceiling_matches_the_python_mirror(self):
+    def test_constants_match_the_python_mirror(self):
         self.assertIn("1.0f - 1.0f / 2048.0f", self.source)
+        self.assertIn("kKneeStart = 0.8f", self.source)
+        self.assertIn("kKneeScale = 1.0f", self.source)
 
 
 if __name__ == "__main__":
