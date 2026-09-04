@@ -12,17 +12,49 @@ This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5
 
 ## Build
 
-Requirements: Windows 11, Visual Studio 2022 with Desktop C++ workload, Git, Subversion, CMake, compatible NVIDIA driver, and enough disk space for Blender build.
+Requirements: Windows 11, MSVC with the Desktop C++ workload (Visual Studio 2022
+or Build Tools 18), Git with Git LFS, CMake, and a compatible NVIDIA driver.
+Building the GPU path additionally needs the **OptiX SDK 8.0 or newer** (headers
+only, there is no OptiX library to link) and the **CUDA Toolkit 12.x**. Allow
+roughly 40 GB of disk.
 
-Run from **x64 Native Tools Command Prompt for VS 2022**:
+CUDA 12.x specifically: Blender pins 12.8 in `build_files/config/pipeline_config.yaml`,
+and CUDA 13 fails two separate ways here, dying inside NVVM on the Cycles
+megakernel and emitting PTX newer than current drivers will load.
+`scripts/msvc_env.ps1` prefers an installed 12.x automatically and warns when it
+can only find something newer.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\fetch_blender.ps1
 powershell -ExecutionPolicy Bypass -File scripts\apply_patch.ps1
-powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+python blender-src\build_files\utils\make_update.py --no-blender
+
+# -CudaArch names your GPU's architecture: sm_120 for Blackwell, sm_89 for Ada.
+# Blender otherwise builds ten of them, each a full megakernel compile.
+.\scripts\configure_cmake.ps1 -OptixRoot "C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0" -CudaArch sm_120
+
+# MSVC 14.50 mis-parses the response file CMake generates for blender.exe and
+# fails with LNK1181 on a path that is correct on disk. This relinks by hand.
+.\scripts\link_blender_workaround.ps1
+cmake --install build\blender
 ```
 
-Scripts pin Blender to commit `a3db93c5b2595a79f65f304114c23aeef8c2139f` (`v5.0.1`). `WITH_CYCLES_DLSS5_NR` defaults to `OFF`; build script enables it.
+No Developer Command Prompt is needed: `scripts/msvc_env.ps1` locates MSVC, the
+Windows SDK, CMake and the CUDA Toolkit itself. That is also why `make.bat` is
+not used, since its Visual Studio detection does not recognise Build Tools 18.
+
+Omitting `-CudaArch` builds the OptiX kernels without CUDA cubins. That is much
+faster and works on a CUDA 13 toolkit, but it will not render: Blender's OptiX
+device derives from the CUDA one and still needs the cubin.
+
+Build the bridge and caller shim separately, into `native/bin` and
+`runtime/caller`:
+
+```powershell
+.\native\build_native.ps1
+```
+
+Scripts pin Blender to commit `a3db93c5b2595a79f65f304114c23aeef8c2139f` (`v5.0.1`). `WITH_CYCLES_DLSS5_NR` defaults to `OFF`; the configure script enables it.
 
 ## Runtime setup
 
@@ -44,6 +76,20 @@ Packager refuses to include proprietary NVIDIA runtime DLLs.
 python -m unittest discover -s tests -v
 python tools/check_no_proprietary_binaries.py
 ```
+
+To measure what a denoiser does to a render rather than eyeball it, render one
+fixed scene several ways. The scene is deliberately full of values above 1.0,
+since that is where a display-referred model differs from an HDR one:
+
+```powershell
+$env:CYCLES_DLSS5NR_BRIDGE = "$PWD\native\bin\dlss5nr_bridge.dll"
+$env:CYCLES_DLSS5NR_RUNTIME = "$PWD\runtime"
+.\build\blender\bin\blender.exe -b --factory-startup -P tools\denoise_compare.py -- --out .\build\compare
+```
+
+It refuses a GPU comparison without an OptiX device, because Cycles otherwise
+falls back to the CPU and off DLSS 5 NR silently, which looks indistinguishable
+from a denoiser that ran and changed nothing.
 
 Windows RTX smoke test:
 
