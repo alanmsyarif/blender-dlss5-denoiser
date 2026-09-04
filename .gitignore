@@ -14,6 +14,13 @@ blender-src/
 *.lib
 *.pdb
 
-# Never commit the NVIDIA runtime
+# Never commit the NVIDIA runtime. Named explicitly so the intent is obvious,
+# but the *.dll rule below is what actually holds: a renamed copy such as
+# "nvngx_dlssnr - Copy.dll" is just as proprietary and matched no rule here.
 runtime/nvngx_dlssnr.dll
 runtime/_nvngx.dll
+
+# This repository is source-only. Nothing tracked is a binary, so refusing all
+# of them costs nothing and closes the renamed-copy hole for good.
+*.dll
+*.exe
