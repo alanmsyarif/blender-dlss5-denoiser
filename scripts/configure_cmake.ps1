@@ -80,8 +80,24 @@ if ($OptixRoot) {
   $cmakeArgs += @(
     '-DWITH_CYCLES_DEVICE_OPTIX=ON',
     '-DWITH_CYCLES_DEVICE_CUDA=ON',
-    "-DOPTIX_ROOT_DIR=$OptixRoot"
+    "-DOPTIX_ROOT_DIR=$($OptixRoot -replace '\\', '/')"
   )
+  # Pin the toolkit CMake uses to the one msvc_env.ps1 selected. FindCUDA
+  # caches CUDA_TOOLKIT_ROOT_DIR and CUDA_NVCC_EXECUTABLE on first success, so
+  # without this a build dir configured against an older or newer toolkit keeps
+  # using it however the PATH changes, and the mismatch only shows up later as
+  # kernels that fail to compile or fail to load.
+  # Forward slashes, always. FindCUDA re-parses CUDA_TOOLKIT_ROOT_DIR as CMake
+  # code, where a Windows path fails with "Invalid character escape '\P'" on
+  # the first backslash of "C:\Program Files".
+  if ($env:CUDA_PATH) {
+    $cudaPathForward = $env:CUDA_PATH -replace '\\', '/'
+    $cmakeArgs += @(
+      "-DCUDA_TOOLKIT_ROOT_DIR=$cudaPathForward",
+      "-DCUDA_NVCC_EXECUTABLE=$cudaPathForward/bin/nvcc.exe"
+    )
+  }
+
   # Kernel binaries decide whether Cycles offers the GPU at all, not just how
   # fast it renders: device_cuda_init refuses the device unless it finds either
   # precompiled kernels or a CUDA compiler, so with this OFF the denoiser list

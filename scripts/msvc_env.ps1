@@ -178,6 +178,30 @@ if ($cudaRoot) {
     $env:CUDA_PATH = $cudaRoot.FullName
     $env:PATH = "$(Join-Path $cudaRoot.FullName 'bin');$env:PATH"
     Write-Host "[DLSS5-NR] CUDA:        $($cudaRoot.FullName)"
+
+    # nvcc refuses a host compiler newer than it knows about:
+    #   fatal error C1189: unsupported Microsoft Visual Studio version! Only
+    #   the versions between 2017 and 2022 (inclusive) are supported!
+    # Visual Studio 2017 to 2022 is toolset 14.1x to 14.4x, so anything from
+    # 14.50 (Visual Studio 18) up trips it. Only override in that case, so a
+    # supported toolset keeps the real check.
+    #
+    # NVCC_PREPEND_FLAGS reaches every nvcc invocation. That matters because
+    # Blender's CUDA_NVCC_FLAGS only feeds the cubin command; the OptiX PTX
+    # command in intern/cycles/kernel/CMakeLists.txt does not read it, so a
+    # CMake-level flag would fix the cubins and leave OptiX still failing.
+    #
+    # This disables a compatibility guard NVIDIA put there deliberately, and
+    # their warning that it "may cause compilation failure or incorrect run
+    # time execution" applies. It is the documented override and the only way
+    # to build without also installing Visual Studio 2022.
+    if ($MsvcCl -match '\\MSVC\\([0-9]+\.[0-9]+)') {
+        $toolset = [version]$Matches[1]
+        if ($toolset -ge [version]'14.50' -and -not $env:NVCC_PREPEND_FLAGS) {
+            $env:NVCC_PREPEND_FLAGS = '-allow-unsupported-compiler'
+            Write-Host "[DLSS5-NR] nvcc:        -allow-unsupported-compiler (MSVC $toolset is newer than CUDA accepts)"
+        }
+    }
 }
 
 # Visual Studio ships a CMake that is not on PATH by default. Blender's
