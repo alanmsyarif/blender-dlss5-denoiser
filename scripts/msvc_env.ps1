@@ -143,11 +143,36 @@ else {
 # started before the toolkit was installed. Without this the configure prints
 # "Could NOT find CUDA (missing: CUDA_TOOLKIT_ROOT_DIR CUDA_NVCC_EXECUTABLE ...)"
 # and silently produces a Blender that enumerates no GPU at all.
-$cudaRoot = Get-ChildItem -Path (Join-Path $pf 'NVIDIA GPU Computing Toolkit\CUDA') -Directory -ErrorAction SilentlyContinue |
-    Where-Object { Test-Path (Join-Path $_.FullName 'bin\nvcc.exe') } |
-    Sort-Object {
-        if ($_.Name -match '^v([0-9]+)\.([0-9]+)$') { [version]"$($Matches[1]).$($Matches[2])" } else { [version]'0.0' }
-    } -Descending | Select-Object -First 1
+# An explicitly set CUDA_PATH wins, so a specific toolkit can be forced.
+if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin\nvcc.exe'))) {
+    $cudaRoot = Get-Item $env:CUDA_PATH
+}
+else {
+    $cudaCandidates = Get-ChildItem -Path (Join-Path $pf 'NVIDIA GPU Computing Toolkit\CUDA') -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName 'bin\nvcc.exe') } |
+        ForEach-Object {
+            $parsed = if ($_.Name -match '^v([0-9]+)\.([0-9]+)$') { [version]"$($Matches[1]).$($Matches[2])" } else { [version]'0.0' }
+            [pscustomobject]@{ Dir = $_; Version = $parsed }
+        }
+
+    # Newest is the wrong default here. Blender pins CUDA 12.8
+    # (build_files/config/pipeline_config.yaml) and warns for anything outside
+    # 10.1, 10.2, 11.x and 12.x, and CUDA 13.3 fails two separate ways: the
+    # Cycles megakernel dies in NVVM with "input module is broken!", and the
+    # compute_75 PTX it does emit is refused at load with "Unsupported PTX
+    # version" by any driver older than that toolkit. Prefer a tested major.
+    $cudaRoot = ($cudaCandidates | Where-Object { $_.Version.Major -eq 12 } | Sort-Object Version -Descending | Select-Object -First 1).Dir
+    if (-not $cudaRoot) {
+        $cudaRoot = ($cudaCandidates | Where-Object { $_.Version.Major -eq 11 } | Sort-Object Version -Descending | Select-Object -First 1).Dir
+    }
+    if (-not $cudaRoot) {
+        $newest = $cudaCandidates | Sort-Object Version -Descending | Select-Object -First 1
+        if ($newest) {
+            $cudaRoot = $newest.Dir
+            Write-Host "[DLSS5-NR] WARNING: only CUDA $($newest.Version) found; Blender tests 11.x and 12.x. Cycles GPU kernels may fail to build or load." -ForegroundColor Yellow
+        }
+    }
+}
 
 if ($cudaRoot) {
     $env:CUDA_PATH = $cudaRoot.FullName
