@@ -135,6 +135,7 @@ static ComPtr<ID3D12Resource> g_depth;
 static ComPtr<ID3D12Resource> g_motion;
 static ComPtr<ID3D12Resource> g_upload;
 static ComPtr<ID3D12Resource> g_readback;
+static constexpr int kMinLongSide = 96;
 static UINT g_width = 0, g_height = 0, g_row_pitch = 0;
 static UINT64 g_total_bytes = 0;
 // Every parameter the model latches at CreateFeature. Changing any of them has
@@ -807,6 +808,23 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     if (!g_initialized) { SetError("DLSS5 NR bridge is not initialized"); CopyError(err, err_cap); return 0; }
     if (!rgb_in || !rgb_out || width <= 0 || height <= 0) { SetError("Invalid image buffer/dimensions"); CopyError(err, err_cap); return 0; }
     if (width > 16384 || height > 16384) { SetError("Image dimensions are unreasonably large"); CopyError(err, err_cap); return 0; }
+
+    // A frame whose longer side is small hangs the GPU rather than failing:
+    // 64x64 returns DXGI_ERROR_DEVICE_HUNG from the evaluate, while 128x32 with
+    // the same 4096 pixels denoises correctly, so the constraint is the longer
+    // side and not the area. 96 is the smallest long side observed to work, via
+    // 96x96 and 97x61; between 65 and 95 is untested because narrowing it means
+    // hanging the GPU again for each probe.
+    //
+    // Refusing here costs one denoise and Cycles carries on. Letting it through
+    // costs a display driver reset, and every later render in the process,
+    // because the device never comes back.
+    if (std::max(width, height) < kMinLongSide) {
+        SetError("DLSS5 NR needs a longer side of at least %d pixels; %dx%d hangs the GPU",
+                 kMinLongSide, width, height);
+        CopyError(err, err_cap);
+        return 0;
+    }
 
     LatchedParams params;
     params.style = style;

@@ -7,13 +7,13 @@ This repository patches Cycles in Blender `v5.0.1` to add a build-gated **DLSS 5
 - Windows x64 and NVIDIA RTX only. RTX 20 and non-RTX are not supported; Ada and Blackwell are the primary targets and Ampere is slow.
 - This integration runs same-resolution and colour-only. That is a limit of this integration, not of the ABI: feature 18 also exposes `DLSSNR.Depth`, `DLSSNR.MVec` and an upscaling path. Cycles depth and motion guides are not wired up yet, so cleared guide textures are bound and the model behaves as a single-frame spatial denoiser. This is not full temporal DLSS Ray Reconstruction.
 - HDR is compressed rather than discarded. The bridge's FP16 staging path applies a Reinhard curve, encodes to sRGB for the model, then inverts both on the way out, so values above 1.0 survive with reduced precision instead of being clipped. Measured against OpenImageDenoise on the same frame, the denoised result keeps 92% of the reference image energy and runs slightly conservative in the highlights, around 0.94x in the 1..15 range and 0.86x above 15. The previous hard clamp to 0..1 kept 51% and flattened 16% of the image onto exactly 1.0.
-- Some resolutions hang the GPU. A 64x64 render reproducibly returns
-  `DXGI_ERROR_DEVICE_HUNG` from the evaluate step, while 97x61 and 128x128 are
-  fine, so it is not simply a minimum size. The bridge now detects this and
-  reports it, and Cycles falls back; before the check it was silent, and the
-  frame came back black while every later render failed to initialize. The
-  trigger is not characterised, because narrowing it down means hanging the
-  GPU repeatedly on purpose.
+- Frames with a short longer side are refused. A 64x64 evaluate hangs the GPU
+  outright, returning `DXGI_ERROR_DEVICE_HUNG`, and the device never comes back,
+  so every later render in that process fails too. 128x32 has the same 4096
+  pixels and denoises correctly, so the constraint is the longer side rather
+  than the area; 96x96 and 97x61 both work. The bridge refuses anything with a
+  longer side below 96 and Cycles carries on. Between 65 and 95 is untested,
+  since each probe means hanging the GPU again.
 - Runtime compatibility is not guaranteed. Failure returns control to Cycles instead of crashing Blender, but output quality and stability require hardware testing.
 - `nvngx_dlssnr.dll` and `_nvngx.dll` are proprietary and never included.
 
