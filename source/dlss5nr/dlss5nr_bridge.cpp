@@ -397,6 +397,22 @@ static bool ExecuteAndWait() {
         CloseHandle(ev);
         if (w != WAIT_OBJECT_0) { SetError("Timed out waiting for DLSS5 NR GPU work"); return false; }
     }
+
+    // A GPU fault fails none of the calls above: the fence still signals, the
+    // readback still maps, and every pixel comes back zero. That surfaced as a
+    // black frame reported as a successful denoise, and left the process unable
+    // to create a D3D12 device again for as long as it ran, so every later
+    // render failed with an error that pointed at initialization rather than at
+    // the frame that actually broke it. Ask the device directly instead.
+    if (g_device) {
+        HRESULT removed = g_device->GetDeviceRemovedReason();
+        if (FAILED(removed)) {
+            SetError("D3D12 device was removed during DLSS5 NR work (0x%08X)",
+                     static_cast<unsigned>(removed));
+            return false;
+        }
+    }
+
     g_cmd_alloc->Reset();
     g_cmd->Reset(g_cmd_alloc.Get(), nullptr);
     return true;
