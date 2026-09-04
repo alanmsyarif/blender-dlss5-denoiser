@@ -5,6 +5,7 @@
 #include "integrator/denoiser_dlss5nr.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -225,7 +226,14 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
             std::max(0.0f, pixels[buffer_index + noisy_offset + channel] * inv_scale);
       }
       if (use_guides) {
-        depth[image_index] = pixels[buffer_index + depth_offset] * inv_scale;
+        /* Depth is not accumulated. The kernel writes it with
+         * film_overwrite_pass_float at sample 0 only, and PASS_DEPTH has
+         * use_filter false so Cycles' own accessor does not divide it by the
+         * sample count either. Scaling it here shrank it by exactly that
+         * count: a scene 21 units deep arrived as 0 to 1.35 at 16 samples,
+         * and at 1024 samples it would have been indistinguishable from an
+         * empty buffer. */
+        depth[image_index] = pixels[buffer_index + depth_offset];
         /* The motion pass is accumulated against its own weight rather than the
          * sample count, which is what divide_type on PASS_MOTION means. Only the
          * first two components are used: they are the vector back to where this
@@ -242,7 +250,26 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
     }
   }
 
-  char error[1024] = {};
+    if (use_guides && !guide_stats_logged_) {
+    guide_stats_logged_ = true;
+    float dmin = depth.empty() ? 0.0f : depth[0];
+    float dmax = dmin;
+    for (const float d : depth) {
+      dmin = std::min(dmin, d);
+      dmax = std::max(dmax, d);
+    }
+    float mmax = 0.0f;
+    double msum = 0.0;
+    for (const float m : motion) {
+      mmax = std::max(mmax, std::fabs(m));
+      msum += std::fabs(m);
+    }
+    LOG_INFO << "DLSS 5 NR guide stats: depth " << dmin << " to " << dmax
+             << ", motion mean |v| " << (motion.empty() ? 0.0 : msum / motion.size())
+             << " max " << mmax;
+  }
+
+char error[1024] = {};
   const bool reset = width_ != buffer_params.width || height_ != buffer_params.height;
   const int ok = use_guides ? process_guided_(input.data(),
                                              output.data(),
