@@ -99,6 +99,18 @@ $env:PATH = "$clDir;$env:PATH"
 $env:INCLUDE = ($MsvcIncludeDirs -join ';')
 $env:LIB = ($MsvcLibDirs -join ';')
 
+# The SDK's tool directory holds rc.exe and mt.exe. Compiling and linking works
+# without them, but anything that builds a resource or a manifest - which
+# includes CMake's own compiler probe - fails with "RC Pass 1 ... no such file
+# or directory" and CMAKE_MT-NOTFOUND.
+$MsvcSdkBin = Join-Path $sdkRoot ('bin\' + $sdkVersion + '\x64')
+if (Test-Path (Join-Path $MsvcSdkBin 'rc.exe')) {
+    $env:PATH = "$MsvcSdkBin;$env:PATH"
+}
+else {
+    Write-Host "[DLSS5-NR] WARNING: rc.exe not found in $MsvcSdkBin" -ForegroundColor Yellow
+}
+
 # Visual Studio ships a CMake that is not on PATH by default. Blender's
 # make.bat needs one, so fall back to it rather than demanding a separate
 # CMake install.
