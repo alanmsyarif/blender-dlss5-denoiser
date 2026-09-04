@@ -12,10 +12,17 @@ if (Test-Path $Source) {
 # checkout with "Object does not exist on the server: [404]" and leaves an
 # empty index.
 #
-# GIT_LFS_SKIP_SMUDGE keeps the clone fast and offline-safe by checking LFS
-# assets out as pointer files. They are brush/asset .blend files, not build
-# inputs, so the build is unaffected. Run 'git -C blender-src lfs pull' if you
-# want the real assets in the packaged build.
+# GIT_LFS_SKIP_SMUDGE keeps the clone fast by checking LFS assets out as
+# pointer files, then only the ones the build actually consumes are pulled
+# back. Most of the ~6400 LFS files are brush and asset .blend libraries worth
+# many GB, but 'release/datafiles' is different: datatoc bakes those into the
+# executable, so a pointer file there is compiled in as if it were the asset.
+# Blender then starts, fails to parse the 131-byte startup.blend with
+# "Failed to read file '', not a blend file", and dies on the null Main with
+# EXCEPTION_ACCESS_VIOLATION before Python is even up.
+#
+# Run 'git -C blender-src lfs pull' for the full asset libraries in a
+# packaged build. That is optional; the pull below is not.
 $PreviousSkipSmudge = $env:GIT_LFS_SKIP_SMUDGE
 $env:GIT_LFS_SKIP_SMUDGE = '1'
 try {
@@ -31,6 +38,10 @@ try {
 finally {
   $env:GIT_LFS_SKIP_SMUDGE = $PreviousSkipSmudge
 }
+# ~195 files, about 10 MB, against ~20 GB for every LFS object in the repo.
+git -C $Source lfs pull --include="release/datafiles/**"
+if ($LASTEXITCODE -ne 0) { throw 'Failed to pull release/datafiles LFS objects.' }
+
 $Commit = (git -C $Source rev-parse HEAD).Trim()
 if ($Commit -ne $ExpectedCommit) {
   throw "Unexpected Blender commit $Commit; expected $ExpectedCommit."

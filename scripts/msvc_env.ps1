@@ -6,6 +6,32 @@
 
 $ErrorActionPreference = 'Stop'
 
+function Invoke-Native {
+    <#
+    .SYNOPSIS
+    Run a native executable without letting its stderr abort the script.
+
+    .DESCRIPTION
+    Windows PowerShell 5.1 wraps every line a native command writes to stderr in
+    a NativeCommandError. Under ErrorActionPreference='Stop' that is terminating,
+    so the script dies on output that is merely informational: a single CMake
+    dev warning from find_package was enough to abort a configure halfway, with
+    the real error nowhere in the transcript.
+
+    Exit code is the only reliable success signal for a native tool, so callers
+    check $LASTEXITCODE themselves. This just keeps stderr non-fatal while the
+    command runs, and restores the previous preference afterwards.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(ValueFromRemainingArguments = $true)] [string[]] $Arguments = @()
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Path @Arguments }
+    finally { $ErrorActionPreference = $previous }
+}
+
 function Fail([string]$Message) {
     Write-Host ""
     Write-Host "[DLSS5-NR] ERROR: $Message" -ForegroundColor Red
@@ -98,6 +124,85 @@ $clDir = Split-Path -Parent $MsvcCl
 $env:PATH = "$clDir;$env:PATH"
 $env:INCLUDE = ($MsvcIncludeDirs -join ';')
 $env:LIB = ($MsvcLibDirs -join ';')
+
+# The SDK's tool directory holds rc.exe and mt.exe. Compiling and linking works
+# without them, but anything that builds a resource or a manifest - which
+# includes CMake's own compiler probe - fails with "RC Pass 1 ... no such file
+# or directory" and CMAKE_MT-NOTFOUND.
+$MsvcSdkBin = Join-Path $sdkRoot ('bin\' + $sdkVersion + '\x64')
+if (Test-Path (Join-Path $MsvcSdkBin 'rc.exe')) {
+    $env:PATH = "$MsvcSdkBin;$env:PATH"
+}
+else {
+    Write-Host "[DLSS5-NR] WARNING: rc.exe not found in $MsvcSdkBin" -ForegroundColor Yellow
+}
+
+# The CUDA Toolkit is optional: only a build with WITH_CYCLES_CUDA_BINARIES=ON
+# needs nvcc. When it is installed, put it on PATH and export CUDA_PATH, because
+# CMake's FindCUDA looks for exactly those and finds neither in a shell that was
+# started before the toolkit was installed. Without this the configure prints
+# "Could NOT find CUDA (missing: CUDA_TOOLKIT_ROOT_DIR CUDA_NVCC_EXECUTABLE ...)"
+# and silently produces a Blender that enumerates no GPU at all.
+# An explicitly set CUDA_PATH wins, so a specific toolkit can be forced.
+if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin\nvcc.exe'))) {
+    $cudaRoot = Get-Item $env:CUDA_PATH
+}
+else {
+    $cudaCandidates = Get-ChildItem -Path (Join-Path $pf 'NVIDIA GPU Computing Toolkit\CUDA') -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName 'bin\nvcc.exe') } |
+        ForEach-Object {
+            $parsed = if ($_.Name -match '^v([0-9]+)\.([0-9]+)$') { [version]"$($Matches[1]).$($Matches[2])" } else { [version]'0.0' }
+            [pscustomobject]@{ Dir = $_; Version = $parsed }
+        }
+
+    # Newest is the wrong default here. Blender pins CUDA 12.8
+    # (build_files/config/pipeline_config.yaml) and warns for anything outside
+    # 10.1, 10.2, 11.x and 12.x, and CUDA 13.3 fails two separate ways: the
+    # Cycles megakernel dies in NVVM with "input module is broken!", and the
+    # compute_75 PTX it does emit is refused at load with "Unsupported PTX
+    # version" by any driver older than that toolkit. Prefer a tested major.
+    $cudaRoot = ($cudaCandidates | Where-Object { $_.Version.Major -eq 12 } | Sort-Object Version -Descending | Select-Object -First 1).Dir
+    if (-not $cudaRoot) {
+        $cudaRoot = ($cudaCandidates | Where-Object { $_.Version.Major -eq 11 } | Sort-Object Version -Descending | Select-Object -First 1).Dir
+    }
+    if (-not $cudaRoot) {
+        $newest = $cudaCandidates | Sort-Object Version -Descending | Select-Object -First 1
+        if ($newest) {
+            $cudaRoot = $newest.Dir
+            Write-Host "[DLSS5-NR] WARNING: only CUDA $($newest.Version) found; Blender tests 11.x and 12.x. Cycles GPU kernels may fail to build or load." -ForegroundColor Yellow
+        }
+    }
+}
+
+if ($cudaRoot) {
+    $env:CUDA_PATH = $cudaRoot.FullName
+    $env:PATH = "$(Join-Path $cudaRoot.FullName 'bin');$env:PATH"
+    Write-Host "[DLSS5-NR] CUDA:        $($cudaRoot.FullName)"
+
+    # nvcc refuses a host compiler newer than it knows about:
+    #   fatal error C1189: unsupported Microsoft Visual Studio version! Only
+    #   the versions between 2017 and 2022 (inclusive) are supported!
+    # Visual Studio 2017 to 2022 is toolset 14.1x to 14.4x, so anything from
+    # 14.50 (Visual Studio 18) up trips it. Only override in that case, so a
+    # supported toolset keeps the real check.
+    #
+    # NVCC_PREPEND_FLAGS reaches every nvcc invocation. That matters because
+    # Blender's CUDA_NVCC_FLAGS only feeds the cubin command; the OptiX PTX
+    # command in intern/cycles/kernel/CMakeLists.txt does not read it, so a
+    # CMake-level flag would fix the cubins and leave OptiX still failing.
+    #
+    # This disables a compatibility guard NVIDIA put there deliberately, and
+    # their warning that it "may cause compilation failure or incorrect run
+    # time execution" applies. It is the documented override and the only way
+    # to build without also installing Visual Studio 2022.
+    if ($MsvcCl -match '\\MSVC\\([0-9]+\.[0-9]+)') {
+        $toolset = [version]$Matches[1]
+        if ($toolset -ge [version]'14.50' -and -not $env:NVCC_PREPEND_FLAGS) {
+            $env:NVCC_PREPEND_FLAGS = '-allow-unsupported-compiler'
+            Write-Host "[DLSS5-NR] nvcc:        -allow-unsupported-compiler (MSVC $toolset is newer than CUDA accepts)"
+        }
+    }
+}
 
 # Visual Studio ships a CMake that is not on PATH by default. Blender's
 # make.bat needs one, so fall back to it rather than demanding a separate

@@ -223,6 +223,37 @@ static float SrgbToLinear(float c) {
     return powf((c + 0.055f) / 1.055f, 2.4f);
 }
 
+// Reinhard, applied before the sRGB encode so the model still receives
+// display-referred colour inside [0, 1). This replaces a hard clamp to 0..1,
+// which discarded every highlight instead of compressing it: measured on a
+// Cycles scene with ordinary emissives, the clamp flattened 16% of the image
+// onto exactly 1.0 and cost 49% of the total image energy.
+//
+// Stateless on purpose. An exposure derived from the frame would fit the data
+// better, but it would also change from frame to frame, and this denoiser runs
+// per viewport update, where that reads as flicker.
+static float TonemapForward(float c) {
+    // The negated comparison also rejects NaN, which would otherwise reach the
+    // model and come back as a dead pixel.
+    if (!(c > 0.0f)) {
+        return 0.0f;
+    }
+    return c / (1.0f + c);
+}
+
+// The largest value FP16 represents below 1.0 is 1 - 2^-11, so the inverse can
+// carry roughly 2047 at most. Clamping to it keeps the division finite rather
+// than returning infinity for a channel the model handed back as exactly 1.0.
+static constexpr float kTonemapCeiling = 1.0f - 1.0f / 2048.0f;
+
+static float TonemapInverse(float c) {
+    if (!(c > 0.0f)) {
+        return 0.0f;
+    }
+    c = std::min(c, kTonemapCeiling);
+    return c / (1.0f - c);
+}
+
 static void SetError(const char* fmt, ...) {
     char buf[4096];
     va_list ap;
@@ -366,6 +397,22 @@ static bool ExecuteAndWait() {
         CloseHandle(ev);
         if (w != WAIT_OBJECT_0) { SetError("Timed out waiting for DLSS5 NR GPU work"); return false; }
     }
+
+    // A GPU fault fails none of the calls above: the fence still signals, the
+    // readback still maps, and every pixel comes back zero. That surfaced as a
+    // black frame reported as a successful denoise, and left the process unable
+    // to create a D3D12 device again for as long as it ran, so every later
+    // render failed with an error that pointed at initialization rather than at
+    // the frame that actually broke it. Ask the device directly instead.
+    if (g_device) {
+        HRESULT removed = g_device->GetDeviceRemovedReason();
+        if (FAILED(removed)) {
+            SetError("D3D12 device was removed during DLSS5 NR work (0x%08X)",
+                     static_cast<unsigned>(removed));
+            return false;
+        }
+    }
+
     g_cmd_alloc->Reset();
     g_cmd->Reset(g_cmd_alloc.Get(), nullptr);
     return true;
@@ -787,9 +834,9 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
         const float* src = rgb_in + static_cast<size_t>(y) * width * 3;
         for (int x = 0; x < width; ++x) {
             // The model expects display-referred colour; Cycles hands us linear.
-            row[x * 4 + 0] = FloatToHalf(LinearToSrgb(std::clamp(src[x * 3 + 0], 0.0f, 1.0f)));
-            row[x * 4 + 1] = FloatToHalf(LinearToSrgb(std::clamp(src[x * 3 + 1], 0.0f, 1.0f)));
-            row[x * 4 + 2] = FloatToHalf(LinearToSrgb(std::clamp(src[x * 3 + 2], 0.0f, 1.0f)));
+            row[x * 4 + 0] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 0])));
+            row[x * 4 + 1] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 1])));
+            row[x * 4 + 2] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 2])));
             row[x * 4 + 3] = FloatToHalf(1.0f);
         }
     }
@@ -843,9 +890,9 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
             // DLSSNR builds have been observed to produce B,G,R,A while patched
             // Ada builds may produce R,G,B,A. Python selects/auto-detects the
             // correct interpretation instead of hard-coding a swap here.
-            dstf[x * 3 + 0] = SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 0]), 0.0f, 1.0f));
-            dstf[x * 3 + 1] = SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 1]), 0.0f, 1.0f));
-            dstf[x * 3 + 2] = SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 2]), 0.0f, 1.0f));
+            dstf[x * 3 + 0] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 0]), 0.0f, 1.0f)));
+            dstf[x * 3 + 1] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 1]), 0.0f, 1.0f)));
+            dstf[x * 3 + 2] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 2]), 0.0f, 1.0f)));
         }
     }
     g_readback->Unmap(0, nullptr);
