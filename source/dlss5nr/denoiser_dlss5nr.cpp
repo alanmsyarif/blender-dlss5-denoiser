@@ -136,10 +136,19 @@ void DLSS5NRDenoiser::unload_runtime()
   init_ = nullptr;
   process_ = nullptr;
   shutdown_ = nullptr;
-  if (bridge_module_) {
-    FreeLibrary(bridge_module_);
-    bridge_module_ = nullptr;
-  }
+
+  /* The bridge is deliberately left mapped for the process lifetime, exactly
+   * like the NGX modules it loads. Calling FreeLibrary here unmapped it while
+   * NGX and the caller shim still held pointers into it, and Blender then died
+   * with EXCEPTION_ACCESS_VIOLATION during shutdown, after the render had
+   * already been written. The crash handler could not even write its own log,
+   * which is what unmapping code out from under a live callback looks like.
+   *
+   * This runs whenever the denoiser is destroyed, which includes every change
+   * of render settings, so leaking one module handle is much the better trade.
+   * dlss5nr_shutdown above already releases the D3D12 and NGX resources, and
+   * a later ensure_runtime simply loads the module again and takes a fresh
+   * reference. */
 #endif
 }
 
