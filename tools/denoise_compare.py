@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="GPU", choices=("GPU", "CPU"))
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="render each denoiser this many times; DLSS 5 NR is not deterministic",
+    )
+    parser.add_argument(
         "--denoisers",
         default="NONE,OPENIMAGEDENOISE,DLSS5NR",
         help="comma separated; NONE renders without denoising",
@@ -77,7 +83,6 @@ def build_scene(device: str, samples: int, denoiser: str) -> None:
     bpy.ops.object.shade_smooth()
 
     material = bpy.data.materials.new("Emit")
-    material.use_nodes = True
     tree = material.node_tree
     tree.nodes.clear()
     emission = tree.nodes.new("ShaderNodeEmission")
@@ -114,17 +119,28 @@ def main() -> int:
     args = parse_args()
     results: dict[str, np.ndarray] = {}
 
+    spreads: dict[str, list[float]] = {}
+
     for denoiser in [name.strip().upper() for name in args.denoisers.split(",") if name.strip()]:
-        build_scene(args.device, args.samples, denoiser)
-        resolved = bpy.context.scene.cycles.denoiser if denoiser != "NONE" else "NONE"
-        if denoiser != "NONE" and resolved != denoiser:
-            # Cycles accepted the assignment but fell back to something else.
-            print(f"  {denoiser}: SKIPPED, Cycles resolved it to {resolved}")
-            continue
-        try:
-            results[denoiser] = render(f"{args.out}/{denoiser.lower()}_{args.device.lower()}")
-        except Exception as error:  # a denoiser that cannot run should not hide the others
-            print(f"  {denoiser}: FAILED, {error}")
+        for repeat in range(args.repeats):
+            build_scene(args.device, args.samples, denoiser)
+            resolved = bpy.context.scene.cycles.denoiser if denoiser != "NONE" else "NONE"
+            if denoiser != "NONE" and resolved != denoiser:
+                # Cycles accepted the assignment but fell back to something else.
+                print(f"  {denoiser}: SKIPPED, Cycles resolved it to {resolved}")
+                break
+            try:
+                pixels = render(
+                    f"{args.out}/{denoiser.lower()}_{args.device.lower()}"
+                    + (f"_{repeat}" if args.repeats > 1 else "")
+                )
+            except Exception as error:  # one broken denoiser should not hide the others
+                print(f"  {denoiser}: FAILED, {error}")
+                break
+            # The last render is what the comparisons below use; the means are
+            # kept so a single run cannot be mistaken for a repeatable number.
+            results[denoiser] = pixels
+            spreads.setdefault(denoiser, []).append(float(pixels.mean()))
 
     if not results:
         print("no renders completed")
@@ -138,6 +154,16 @@ def main() -> int:
             f"{np.percentile(pixels, 99):>10.4f}{(pixels > 1.0).mean():>10.4f}"
             f"{np.isclose(pixels, 1.0, atol=1e-6).mean():>10.4f}"
         )
+
+    if args.repeats > 1:
+        print("")
+        print("mean over repeats (DLSS 5 NR is not deterministic; OptiX and OIDN are):")
+        for name, means in spreads.items():
+            lo, hi = min(means), max(means)
+            print(
+                f"  {name:<18} mean={sum(means) / len(means):.4f}"
+                f"  min={lo:.4f} max={hi:.4f}  spread={100 * (hi - lo) / hi:.1f}%"
+            )
 
     # OpenImageDenoise is the reference: it is a mature HDR denoiser that leaves
     # the range alone, so differences against it separate "this model is worse"

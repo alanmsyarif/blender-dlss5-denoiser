@@ -133,9 +133,20 @@ static ComPtr<ID3D12Resource> g_color;
 static ComPtr<ID3D12Resource> g_output;
 static ComPtr<ID3D12Resource> g_depth;
 static ComPtr<ID3D12Resource> g_motion;
+static ComPtr<ID3D12Resource> g_upload_guide;
 static ComPtr<ID3D12Resource> g_upload;
 static ComPtr<ID3D12Resource> g_readback;
+static constexpr int kMinLongSide = 96;
+
+// Highest linear value handed to us this frame. The inverse tonemap is convex,
+// so a model output near 1.0 reconstructs to an enormous number; clamping the
+// result to a little above what actually went in turns those into bright
+// pixels instead of 2047.8 fireflies that would wreck any bloom or grade.
+static float g_frame_max_in = 0.0f;
+static constexpr float kMaxOvershoot = 1.5f;
 static UINT g_width = 0, g_height = 0, g_row_pitch = 0;
+static UINT g_guide_row_pitch = 0;
+static UINT64 g_guide_bytes = 0;
 static UINT64 g_total_bytes = 0;
 // Every parameter the model latches at CreateFeature. Changing any of them has
 // no effect until the feature is rebuilt, so all of them are tracked.
@@ -232,13 +243,23 @@ static float SrgbToLinear(float c) {
 // Stateless on purpose. An exposure derived from the frame would fit the data
 // better, but it would also change from frame to frame, and this denoiser runs
 // per viewport update, where that reads as flicker.
+// Everything below the knee passes through untouched, so the range a render
+// actually spends most of its pixels in keeps full precision, and only the
+// excess above it is compressed into what is left of [0, 1).
+static constexpr float kKneeStart = 0.8f;
+static constexpr float kKneeScale = 1.0f;
+
 static float TonemapForward(float c) {
     // The negated comparison also rejects NaN, which would otherwise reach the
     // model and come back as a dead pixel.
     if (!(c > 0.0f)) {
         return 0.0f;
     }
-    return c / (1.0f + c);
+    if (c <= kKneeStart) {
+        return c;
+    }
+    const float over = c - kKneeStart;
+    return kKneeStart + (1.0f - kKneeStart) * (over / (over + kKneeScale));
 }
 
 // The largest value FP16 represents below 1.0 is 1 - 2^-11, so the inverse can
@@ -250,8 +271,12 @@ static float TonemapInverse(float c) {
     if (!(c > 0.0f)) {
         return 0.0f;
     }
-    c = std::min(c, kTonemapCeiling);
-    return c / (1.0f - c);
+    if (c <= kKneeStart) {
+        return c;
+    }
+    float over = (c - kKneeStart) / (1.0f - kKneeStart);
+    over = std::min(over, kTonemapCeiling);
+    return kKneeStart + kKneeScale * over / (1.0f - over);
 }
 
 static void SetError(const char* fmt, ...) {
@@ -508,10 +533,61 @@ static void ReleaseFeatureAndResources() {
         g_feature = nullptr;
     }
     g_color.Reset(); g_output.Reset(); g_upload.Reset(); g_readback.Reset();
-    g_depth.Reset(); g_motion.Reset();
+    g_depth.Reset(); g_motion.Reset(); g_upload_guide.Reset();
+    g_guide_row_pitch = 0; g_guide_bytes = 0;
     g_width = g_height = g_row_pitch = 0;
     g_total_bytes = 0;
     g_latched = LatchedParams{};
+}
+
+// Stage one guide texture through the shared upload buffer. Depth is R32_FLOAT
+// and motion is R16G16_FLOAT, both four bytes per pixel, so a single staging
+// buffer and row pitch serve both.
+static bool UploadGuideTexture(ID3D12Resource* texture,
+                               DXGI_FORMAT format,
+                               const void* packed_rows,
+                               UINT width,
+                               UINT height) {
+    if (!g_upload_guide || !texture) {
+        return false;
+    }
+    void* mapped = nullptr;
+    if (FAILED(g_upload_guide->Map(0, nullptr, &mapped)) || !mapped) {
+        return false;
+    }
+    auto* dst_base = static_cast<uint8_t*>(mapped);
+    const auto* src_base = static_cast<const uint8_t*>(packed_rows);
+    const size_t row_bytes = static_cast<size_t>(width) * 4u;
+    for (UINT y = 0; y < height; ++y) {
+        memcpy(dst_base + static_cast<size_t>(y) * g_guide_row_pitch,
+               src_base + static_cast<size_t>(y) * row_bytes,
+               row_bytes);
+    }
+    g_upload_guide->Unmap(0, nullptr);
+
+    auto to_copy = Barrier(texture,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                           D3D12_RESOURCE_STATE_COPY_DEST);
+    g_cmd->ResourceBarrier(1, &to_copy);
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = g_upload_guide.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint.Format = format;
+    src.PlacedFootprint.Footprint.Width = width;
+    src.PlacedFootprint.Footprint.Height = height;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = g_guide_row_pitch;
+    g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    auto to_read = Barrier(texture,
+                           D3D12_RESOURCE_STATE_COPY_DEST,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g_cmd->ResourceBarrier(1, &to_read);
+    return true;
 }
 
 static bool AllocateFrameResources(UINT w, UINT h) {
@@ -528,6 +604,11 @@ static bool AllocateFrameResources(UINT w, UINT h) {
 
     g_row_pitch = (w * 8u + 255u) & ~255u;
     g_total_bytes = static_cast<UINT64>(g_row_pitch) * h;
+    // Depth is R32_FLOAT and motion is R16G16_FLOAT, both four bytes per
+    // pixel, so one staging buffer and pitch covers both guides.
+    g_guide_row_pitch = (w * 4u + 255u) & ~255u;
+    g_guide_bytes = static_cast<UINT64>(g_guide_row_pitch) * h;
+    g_upload_guide = CreateLinearBuffer(g_guide_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     g_upload = CreateLinearBuffer(g_total_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     g_readback = CreateLinearBuffer(g_total_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     if (!g_upload || !g_readback) { SetError("Failed to create D3D12 upload/readback buffers"); return false; }
@@ -544,17 +625,18 @@ static void SetCreateParams(const LatchedParams& p) {
     // pair and which one is not documented.
     VSetUInt("Width", g_width);
     VSetUInt("Height", g_height);
-    VSetUInt("OutWidth", g_width);
-    VSetUInt("OutHeight", g_height);
     VSetUInt("PerfQualityValue", 2);
     VSetUInt("DLSSNR.Enabled", 1);
     VSetUInt("DLSSNR.Width", g_width);
     VSetUInt("DLSSNR.Height", g_height);
-    VSetUInt("DLSSNR.InputWidth", g_width);
-    VSetUInt("DLSSNR.InputHeight", g_height);
-    VSetUInt("DLSSNR.OutputWidth", g_width);
-    VSetUInt("DLSSNR.OutputHeight", g_height);
-    VSetUInt("DLSSNR.Upscaling", 0);
+    /* Only names the runtime actually contains are set here. Scanning
+     * nvngx_dlssnr.dll for its parameter strings showed that OutWidth,
+     * OutHeight, DLSSNR.InputWidth, DLSSNR.InputHeight, DLSSNR.OutputWidth,
+     * DLSSNR.OutputHeight and DLSSNR.Upscaling do not exist in it at all, so
+     * setting them did nothing and made the bridge look like it was choosing
+     * same-resolution operation when it was only failing to ask for anything.
+     * The real resolution control is DLSSNR.ScalingRatio, which is left unset
+     * because the upscaling path is not wired up. */
     VSetUInt("DLSSNR.Style", static_cast<unsigned>(p.style));
     VSetUInt("DLSSNR.Hint.Render.Preset", static_cast<unsigned>(p.preset));
     VSetFloat("DLSSNR.Intensity", p.intensity);
@@ -797,8 +879,10 @@ __declspec(dllexport) int __cdecl dlss5nr_init(int gpu_index, const wchar_t* run
     return 1;
 }
 
-__declspec(dllexport) int __cdecl dlss5nr_process(
-    const float* rgb_in, float* rgb_out, int width, int height,
+static int ProcessInternal(
+    const float* rgb_in, float* rgb_out,
+    const float* depth_in, const float* motion_in,
+    int width, int height,
     int style, int preset, float intensity, float tone, float structure, float skin,
     int automask, int reset, char* err, int err_cap) {
 
@@ -807,6 +891,23 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     if (!g_initialized) { SetError("DLSS5 NR bridge is not initialized"); CopyError(err, err_cap); return 0; }
     if (!rgb_in || !rgb_out || width <= 0 || height <= 0) { SetError("Invalid image buffer/dimensions"); CopyError(err, err_cap); return 0; }
     if (width > 16384 || height > 16384) { SetError("Image dimensions are unreasonably large"); CopyError(err, err_cap); return 0; }
+
+    // A frame whose longer side is small hangs the GPU rather than failing:
+    // 64x64 returns DXGI_ERROR_DEVICE_HUNG from the evaluate, while 128x32 with
+    // the same 4096 pixels denoises correctly, so the constraint is the longer
+    // side and not the area. 96 is the smallest long side observed to work, via
+    // 96x96 and 97x61; between 65 and 95 is untested because narrowing it means
+    // hanging the GPU again for each probe.
+    //
+    // Refusing here costs one denoise and Cycles carries on. Letting it through
+    // costs a display driver reset, and every later render in the process,
+    // because the device never comes back.
+    if (std::max(width, height) < kMinLongSide) {
+        SetError("DLSS5 NR needs a longer side of at least %d pixels; %dx%d hangs the GPU",
+                 kMinLongSide, width, height);
+        CopyError(err, err_cap);
+        return 0;
+    }
 
     LatchedParams params;
     params.style = style;
@@ -822,21 +923,46 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     if (!EnsureFeature(static_cast<UINT>(width), static_cast<UINT>(height), params)) {
         CopyError(err, err_cap); return 0;
     }
-    SetEvalParams((reset || rebuilt) ? 1 : 0);
+    // Always reset. This is Ray Reconstruction, so the model accumulates history
+    // across evaluations, but the integration binds cleared depth and motion
+    // guides: there is no correspondence between frames for it to accumulate
+    // along.
+    //
+    // The model itself is deterministic. Calling this function twice with the
+    // same pixels and the same parameters returns bit identical output. What
+    // varies is what Cycles hands it: progressive denoising and adaptive
+    // sampling mean successive evaluations see different accumulated buffers,
+    // and with reset off the model folded those differences into its history.
+    // Repeated renders of one fixed scene then spread 17% in output energy,
+    // which reads as flicker in the viewport. Resetting each evaluation halves
+    // that, and disabling adaptive sampling takes the remainder to about 2%.
+    //
+    // Once real depth and motion vectors are wired up this should become
+    // (reset || rebuilt) again, and the accumulation is the point of using this
+    // model at all.
+    // With real depth and motion the model has frame to frame correspondence and
+    // can accumulate, which is the point of Ray Reconstruction. Without them
+    // there is nothing to accumulate along, and letting it try produced a 17%
+    // swing in output energy between renders, which reads as flicker.
+    const bool have_guides = (depth_in != nullptr && motion_in != nullptr);
+    SetEvalParams((!have_guides || reset || rebuilt) ? 1 : 0);
 
     void* mapped = nullptr;
     HRESULT hr = g_upload->Map(0, nullptr, &mapped);
     if (FAILED(hr) || !mapped) { SetError("Upload buffer Map failed: 0x%08X", static_cast<unsigned>(hr)); CopyError(err, err_cap); return 0; }
     memset(mapped, 0, static_cast<size_t>(g_total_bytes));
     auto* dst_base = static_cast<uint8_t*>(mapped);
+    g_frame_max_in = 0.0f;
     for (int y = 0; y < height; ++y) {
         auto* row = reinterpret_cast<uint16_t*>(dst_base + static_cast<size_t>(y) * g_row_pitch);
         const float* src = rgb_in + static_cast<size_t>(y) * width * 3;
         for (int x = 0; x < width; ++x) {
             // The model expects display-referred colour; Cycles hands us linear.
-            row[x * 4 + 0] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 0])));
-            row[x * 4 + 1] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 1])));
-            row[x * 4 + 2] = FloatToHalf(LinearToSrgb(TonemapForward(src[x * 3 + 2])));
+            for (int ch = 0; ch < 3; ++ch) {
+                const float linear = src[x * 3 + ch];
+                if (linear > g_frame_max_in) g_frame_max_in = linear;
+                row[x * 4 + ch] = FloatToHalf(LinearToSrgb(TonemapForward(linear)));
+            }
             row[x * 4 + 3] = FloatToHalf(1.0f);
         }
     }
@@ -854,6 +980,20 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
     g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     auto b2 = Barrier(g_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     g_cmd->ResourceBarrier(1, &b2);
+
+    if (depth_in) {
+        UploadGuideTexture(g_depth.Get(), DXGI_FORMAT_R32_FLOAT, depth_in,
+                           static_cast<UINT>(width), static_cast<UINT>(height));
+    }
+    if (motion_in) {
+        // Two floats per pixel in, one R16G16 texel out.
+        std::vector<uint16_t> packed(static_cast<size_t>(width) * static_cast<size_t>(height) * 2u);
+        for (size_t i = 0; i < packed.size(); ++i) {
+            packed[i] = FloatToHalf(motion_in[i]);
+        }
+        UploadGuideTexture(g_motion.Get(), DXGI_FORMAT_R16G16_FLOAT, packed.data(),
+                           static_cast<UINT>(width), static_cast<UINT>(height));
+    }
 
     NGXResult er = g_shim_eval(reinterpret_cast<void*>(g_nr_eval), g_cmd.Get(), g_feature, g_params, nullptr);
     if (er != NGX_SUCCESS) {
@@ -890,14 +1030,39 @@ __declspec(dllexport) int __cdecl dlss5nr_process(
             // DLSSNR builds have been observed to produce B,G,R,A while patched
             // Ada builds may produce R,G,B,A. Python selects/auto-detects the
             // correct interpretation instead of hard-coding a swap here.
-            dstf[x * 3 + 0] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 0]), 0.0f, 1.0f)));
-            dstf[x * 3 + 1] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 1]), 0.0f, 1.0f)));
-            dstf[x * 3 + 2] = TonemapInverse(SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + 2]), 0.0f, 1.0f)));
+            const float ceiling = g_frame_max_in * kMaxOvershoot;
+            for (int ch = 0; ch < 3; ++ch) {
+                const float value = TonemapInverse(
+                    SrgbToLinear(std::clamp(HalfToFloat(row[x * 4 + ch]), 0.0f, 1.0f)));
+                dstf[x * 3 + ch] = std::min(value, ceiling);
+            }
         }
     }
     g_readback->Unmap(0, nullptr);
     CopyError(err, err_cap);
     return 1;
+}
+
+__declspec(dllexport) int __cdecl dlss5nr_process(
+    const float* rgb_in, float* rgb_out, int width, int height,
+    int style, int preset, float intensity, float tone, float structure, float skin,
+    int automask, int reset, char* err, int err_cap) {
+    // Colour only. The guide textures stay as allocated, and the evaluate is
+    // reset every time because there is no correspondence between frames.
+    return ProcessInternal(rgb_in, rgb_out, nullptr, nullptr, width, height, style, preset,
+                           intensity, tone, structure, skin, automask, reset, err, err_cap);
+}
+
+// depth_in is one float per pixel, motion_in two, both tightly packed and both
+// in the same layout as rgb_in. Passing either as null falls back to the colour
+// only path above.
+__declspec(dllexport) int __cdecl dlss5nr_process_guided(
+    const float* rgb_in, float* rgb_out, const float* depth_in, const float* motion_in,
+    int width, int height,
+    int style, int preset, float intensity, float tone, float structure, float skin,
+    int automask, int reset, char* err, int err_cap) {
+    return ProcessInternal(rgb_in, rgb_out, depth_in, motion_in, width, height, style, preset,
+                           intensity, tone, structure, skin, automask, reset, err, err_cap);
 }
 
 __declspec(dllexport) void __cdecl dlss5nr_shutdown() {

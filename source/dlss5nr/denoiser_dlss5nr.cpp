@@ -5,6 +5,7 @@
 #include "integrator/denoiser_dlss5nr.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -87,6 +88,10 @@ bool DLSS5NRDenoiser::ensure_runtime()
   init_ = reinterpret_cast<InitFn>(GetProcAddress(bridge_module_, "dlss5nr_init"));
   process_ = reinterpret_cast<ProcessFn>(GetProcAddress(bridge_module_, "dlss5nr_process"));
   shutdown_ = reinterpret_cast<ShutdownFn>(GetProcAddress(bridge_module_, "dlss5nr_shutdown"));
+  /* Optional: a bridge built before the guided path simply will not have it,
+   * and the colour only call still works. */
+  process_guided_ = reinterpret_cast<ProcessGuidedFn>(
+      GetProcAddress(bridge_module_, "dlss5nr_process_guided"));
   if (!init_ || !process_ || !shutdown_) {
     set_error("DLSS 5 NR: bridge has missing or incompatible exports.");
     unload_runtime();
@@ -177,12 +182,32 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
    * adaptive sampling the count is per pixel, not the scene-wide num_samples. */
   const int sample_count_offset = buffer_params.get_pass_offset(PASS_SAMPLE_COUNT);
 
+  /* Guides are opportunistic. Cycles only carries these passes when the view
+   * layer asks for them, so a render without the Z and Vector passes gets the
+   * colour only path and an evaluate that resets every frame. With both present
+   * the model has frame to frame correspondence and can accumulate, which is
+   * what Ray Reconstruction is built around. */
+  const int depth_offset = buffer_params.get_pass_offset(PASS_DEPTH);
+  const int motion_offset = buffer_params.get_pass_offset(PASS_MOTION);
+  const int motion_weight_offset = buffer_params.get_pass_offset(PASS_MOTION_WEIGHT);
+  const bool use_guides = process_guided_ != nullptr && depth_offset != PASS_UNUSED &&
+                          motion_offset != PASS_UNUSED;
+  if (guides_logged_ != int(use_guides)) {
+    guides_logged_ = int(use_guides);
+    LOG_INFO << "DLSS 5 NR guides "
+             << (use_guides ? "active: depth and motion, temporal accumulation on" :
+                              "absent: colour only, resetting every frame. Enable the "
+                              "Z and Vector passes for temporal accumulation");
+  }
+
   render_buffers->copy_from_device();
   float *pixels = render_buffers->buffer.data();
   const size_t pixel_count = size_t(buffer_params.width) * size_t(buffer_params.height);
   std::vector<float> input(pixel_count * 3);
   std::vector<float> output(pixel_count * 3);
   std::vector<float> pixel_scale(pixel_count, float(num_samples));
+  std::vector<float> depth(use_guides ? pixel_count : 0);
+  std::vector<float> motion(use_guides ? pixel_count * 2 : 0);
 
   for (int y = 0; y < buffer_params.height; ++y) {
     for (int x = 0; x < buffer_params.width; ++x) {
@@ -200,26 +225,88 @@ bool DLSS5NRDenoiser::denoise_buffer(const BufferParams &buffer_params,
         input[image_index * 3 + channel] =
             std::max(0.0f, pixels[buffer_index + noisy_offset + channel] * inv_scale);
       }
+      if (use_guides) {
+        /* Depth is not accumulated. The kernel writes it with
+         * film_overwrite_pass_float at sample 0 only, and PASS_DEPTH has
+         * use_filter false so Cycles' own accessor does not divide it by the
+         * sample count either. Scaling it here shrank it by exactly that
+         * count: a scene 21 units deep arrived as 0 to 1.35 at 16 samples,
+         * and at 1024 samples it would have been indistinguishable from an
+         * empty buffer. */
+        depth[image_index] = pixels[buffer_index + depth_offset];
+        /* The motion pass is accumulated against its own weight rather than the
+         * sample count, which is what divide_type on PASS_MOTION means. Only the
+         * first two components are used: they are the vector back to where this
+         * pixel was in the previous frame, which is the correspondence the model
+         * needs. The last two point at the next frame and are for vector blur. */
+        float motion_scale = inv_scale;
+        if (motion_weight_offset != PASS_UNUSED) {
+          const float weight = pixels[buffer_index + motion_weight_offset];
+          motion_scale = weight > 0.0f ? 1.0f / weight : 0.0f;
+        }
+        motion[image_index * 2 + 0] = pixels[buffer_index + motion_offset + 0] * motion_scale;
+        motion[image_index * 2 + 1] = pixels[buffer_index + motion_offset + 1] * motion_scale;
+      }
     }
   }
 
-  char error[1024] = {};
+    if (use_guides && !guide_stats_logged_) {
+    guide_stats_logged_ = true;
+    float dmin = depth.empty() ? 0.0f : depth[0];
+    float dmax = dmin;
+    for (const float d : depth) {
+      dmin = std::min(dmin, d);
+      dmax = std::max(dmax, d);
+    }
+    float mmax = 0.0f;
+    double msum = 0.0;
+    for (const float m : motion) {
+      mmax = std::max(mmax, std::fabs(m));
+      msum += std::fabs(m);
+    }
+    LOG_INFO << "DLSS 5 NR guide stats: depth " << dmin << " to " << dmax
+             << ", motion mean |v| " << (motion.empty() ? 0.0 : msum / motion.size())
+             << " max " << mmax;
+  }
+
+char error[1024] = {};
   const bool reset = width_ != buffer_params.width || height_ != buffer_params.height;
-  if (!process_(input.data(),
+  const int ok = use_guides ? process_guided_(input.data(),
+                                             output.data(),
+                                             depth.data(),
+                                             motion.data(),
+                                             buffer_params.width,
+                                             buffer_params.height,
+                                             params_.dlss5nr_style,
+                                             0,
+                                             params_.dlss5nr_intensity,
+                                             params_.dlss5nr_tone,
+                                             params_.dlss5nr_structure,
+                                             params_.dlss5nr_skin,
+                                             params_.dlss5nr_auto_mask ? 1 : 0,
+                                             reset ? 1 : 0,
+                                             error,
+                                             sizeof(error)) :
+                              process_(input.data(),
                 output.data(),
                 buffer_params.width,
                 buffer_params.height,
-                0,    /* style: Default */
-                0,    /* preset: Default */
-                1.0f, /* intensity */
-                1.0f, /* local tone strength */
-                1.0f, /* local structure strength */
-                -1.0f, /* skin structure: negative leaves the model default */
-                0,    /* auto mask */
+                params_.dlss5nr_style,
+                /* Preset is passed at its default because every value across
+                 * its whole 0..3 range produced bit identical output, so either
+                 * the parameter name is wrong or the runtime ignores it. */
+                0, /* preset */
+                params_.dlss5nr_intensity,
+                params_.dlss5nr_tone,
+                params_.dlss5nr_structure,
+                /* Negative leaves the model default alone, and skin only does
+                 * anything when the auto mask is on. */
+                params_.dlss5nr_skin,
+                params_.dlss5nr_auto_mask ? 1 : 0,
                 reset ? 1 : 0,
                 error,
-                sizeof(error)))
-  {
+                sizeof(error));
+  if (!ok) {
     set_error(string("DLSS 5 NR evaluation failed: ") + error);
     failed_ = true;
     unload_runtime();

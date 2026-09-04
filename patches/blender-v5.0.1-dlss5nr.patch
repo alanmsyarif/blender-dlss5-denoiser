@@ -28,7 +28,7 @@ index e7b77090..e253e335 100644
    add_definitions(-DWITH_CYCLES_STANDALONE_GUI)
  endif()
 diff --git a/intern/cycles/blender/addon/properties.py b/intern/cycles/blender/addon/properties.py
-index a37d057a..c7def353 100644
+index a37d057a..fe2a0917 100644
 --- a/intern/cycles/blender/addon/properties.py
 +++ b/intern/cycles/blender/addon/properties.py
 @@ -270,6 +270,13 @@ def enum_openimagedenoise_denoiser(self, context):
@@ -61,6 +61,102 @@ index a37d057a..c7def353 100644
      items += enum_optix_denoiser(self, context)
      items += enum_openimagedenoise_denoiser(self, context)
      return items
+@@ -403,6 +412,52 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
+         default=True,
+         update=update_render_passes,
+     )
++    dlss5nr_style: EnumProperty(
++        name="Style",
++        description="Reconstruction style the DLSS 5 NR model applies",
++        items=(
++            ('DEFAULT', "Default", "Leave the runtime's own choice alone", 0),
++            ('NATURAL', "Natural", "Natural reconstruction", 1),
++            ('CINEMATIC', "Cinematic", "Cinematic reconstruction", 2),
++        ),
++        default='NATURAL',
++    )
++    dlss5nr_intensity: FloatProperty(
++        name="Intensity",
++        description=(
++            "Strength of the DLSS 5 neural rendering effect. The runtime clamps "
++            "this at 1.0, so values above it change nothing; 0.0 turns the "
++            "effect off and leaves the reconstruction alone"
++        ),
++        min=0.0, max=1.0, default=1.0,
++    )
++    dlss5nr_tone: FloatProperty(
++        name="Tone",
++        description="Local tone strength applied by the DLSS 5 NR model",
++        min=0.0, max=2.0, default=1.0,
++    )
++    dlss5nr_structure: FloatProperty(
++        name="Structure",
++        description="Local structure strength applied by the DLSS 5 NR model",
++        min=0.0, max=2.0, default=1.0,
++    )
++    dlss5nr_skin: FloatProperty(
++        name="Skin",
++        description=(
++            "Structure strength for regions the model identifies as skin. "
++            "Requires Auto Mask; below zero leaves the model default alone"
++        ),
++        min=-1.0, max=2.0, default=-1.0,
++    )
++    dlss5nr_auto_mask: BoolProperty(
++        name="Auto Mask",
++        description=(
++            "Let the model classify the image so material specific controls "
++            "such as Skin have something to act on"
++        ),
++        default=False,
++    )
++
+     denoiser: EnumProperty(
+         name="Denoiser",
+         description="Denoise the image with the selected denoiser. "
+diff --git a/intern/cycles/blender/addon/ui.py b/intern/cycles/blender/addon/ui.py
+index d4085ed1..75c1949e 100644
+--- a/intern/cycles/blender/addon/ui.py
++++ b/intern/cycles/blender/addon/ui.py
+@@ -170,6 +170,19 @@ def show_denoise_active(context):
+     return True
+ 
+ 
++def draw_dlss5nr_options(layout, cscene):
++    # Skin is only meaningful once the model is classifying the image, so it is
++    # greyed out rather than hidden: hiding it makes the dependency invisible.
++    layout.prop(cscene, "dlss5nr_style", text="Style")
++    layout.prop(cscene, "dlss5nr_intensity", text="Intensity")
++    layout.prop(cscene, "dlss5nr_tone", text="Tone")
++    layout.prop(cscene, "dlss5nr_structure", text="Structure")
++    layout.prop(cscene, "dlss5nr_auto_mask", text="Auto Mask")
++    sub = layout.column()
++    sub.active = cscene.dlss5nr_auto_mask
++    sub.prop(cscene, "dlss5nr_skin", text="Skin")
++
++
+ def get_effective_preview_denoiser(context, has_oidn_gpu):
+     scene = context.scene
+     cscene = scene.cycles
+@@ -277,6 +290,9 @@ class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
+             col.prop(cscene, "preview_denoising_prefilter", text="Prefilter")
+             col.prop(cscene, "preview_denoising_quality", text="Quality")
+ 
++        if effective_preview_denoiser == 'DLSS5NR':
++            draw_dlss5nr_options(col, cscene)
++
+         col.prop(cscene, "preview_denoising_start_sample", text="Start Sample")
+ 
+         if effective_preview_denoiser == 'OPENIMAGEDENOISE':
+@@ -344,6 +360,8 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
+         sub.prop(cscene, "denoiser", text="Denoiser")
+ 
+         col.prop(cscene, "denoising_input_passes", text="Passes")
++        if cscene.denoiser == 'DLSS5NR':
++            draw_dlss5nr_options(col, cscene)
+         if cscene.denoiser == 'OPENIMAGEDENOISE':
+             col.prop(cscene, "denoising_prefilter", text="Prefilter")
+             col.prop(cscene, "denoising_quality", text="Quality")
 diff --git a/intern/cycles/blender/python.cpp b/intern/cycles/blender/python.cpp
 index 7468bb03..9e4c54ce 100644
 --- a/intern/cycles/blender/python.cpp
@@ -78,8 +174,43 @@ index 7468bb03..9e4c54ce 100644
    if (ccl::openimagedenoise_supported()) {
      PyModule_AddObjectRef(mod, "with_openimagedenoise", Py_True);
    }
+diff --git a/intern/cycles/blender/sync.cpp b/intern/cycles/blender/sync.cpp
+index 239b234d..c1074fe1 100644
+--- a/intern/cycles/blender/sync.cpp
++++ b/intern/cycles/blender/sync.cpp
+@@ -540,6 +540,13 @@ void BlenderSync::sync_integrator(BL::ViewLayer &b_view_layer,
+     integrator->set_use_denoise_pass_normal(denoise_params.use_pass_normal);
+     integrator->set_denoiser_prefilter(denoise_params.prefilter);
+     integrator->set_denoiser_quality(denoise_params.quality);
++
++    integrator->set_dlss5nr_style(denoise_params.dlss5nr_style);
++    integrator->set_dlss5nr_intensity(denoise_params.dlss5nr_intensity);
++    integrator->set_dlss5nr_tone(denoise_params.dlss5nr_tone);
++    integrator->set_dlss5nr_structure(denoise_params.dlss5nr_structure);
++    integrator->set_dlss5nr_skin(denoise_params.dlss5nr_skin);
++    integrator->set_dlss5nr_auto_mask(denoise_params.dlss5nr_auto_mask);
+   }
+ 
+   /* UPDATE_NONE as we don't want to tag the integrator as modified (this was done by the
+@@ -1035,6 +1042,16 @@ DenoiseParams BlenderSync::get_denoise_params(BL::Scene &b_scene,
+ 
+   int input_passes = -1;
+ 
++  /* One set of DLSS 5 NR controls for both final and viewport denoising: they
++   * describe how the model should treat the image, not how much time to spend,
++   * so splitting them per context would only invite the two to disagree. */
++  denoising.dlss5nr_style = get_int(cscene, "dlss5nr_style");
++  denoising.dlss5nr_intensity = get_float(cscene, "dlss5nr_intensity");
++  denoising.dlss5nr_tone = get_float(cscene, "dlss5nr_tone");
++  denoising.dlss5nr_structure = get_float(cscene, "dlss5nr_structure");
++  denoising.dlss5nr_skin = get_float(cscene, "dlss5nr_skin");
++  denoising.dlss5nr_auto_mask = get_boolean(cscene, "dlss5nr_auto_mask");
++
+   if (background) {
+     /* Final Render Denoising */
+     denoising.use = get_boolean(cscene, "use_denoising");
 diff --git a/intern/cycles/device/denoise.cpp b/intern/cycles/device/denoise.cpp
-index 3833a121..852fea11 100644
+index 3833a121..319f1b9c 100644
 --- a/intern/cycles/device/denoise.cpp
 +++ b/intern/cycles/device/denoise.cpp
 @@ -13,6 +13,8 @@ const char *denoiserTypeToHumanReadable(DenoiserType type)
@@ -99,8 +230,22 @@ index 3833a121..852fea11 100644
    }
  
    return &type_enum;
+@@ -83,6 +86,13 @@ NODE_DEFINE(DenoiseParams)
+   SOCKET_ENUM(prefilter, "Prefilter", *prefilter_enum, DENOISER_PREFILTER_FAST);
+   SOCKET_ENUM(quality, "Quality", *quality_enum, DENOISER_QUALITY_HIGH);
+ 
++  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);
++  SOCKET_FLOAT(dlss5nr_intensity, "DLSS5 NR Intensity", 1.0f);
++  SOCKET_FLOAT(dlss5nr_tone, "DLSS5 NR Tone", 1.0f);
++  SOCKET_FLOAT(dlss5nr_structure, "DLSS5 NR Structure", 1.0f);
++  SOCKET_FLOAT(dlss5nr_skin, "DLSS5 NR Skin", -1.0f);
++  SOCKET_BOOLEAN(dlss5nr_auto_mask, "DLSS5 NR Auto Mask", false);
++
+   return type;
+ }
+ 
 diff --git a/intern/cycles/device/denoise.h b/intern/cycles/device/denoise.h
-index e907b8af..742dc4cc 100644
+index e907b8af..9bbc5c48 100644
 --- a/intern/cycles/device/denoise.h
 +++ b/intern/cycles/device/denoise.h
 @@ -11,6 +11,7 @@ CCL_NAMESPACE_BEGIN
@@ -111,6 +256,26 @@ index e907b8af..742dc4cc 100644
    DENOISER_NUM,
  
    DENOISER_NONE = 0,
+@@ -75,6 +76,19 @@ class DenoiseParams : public Node {
+   DenoiserPrefilter prefilter = DENOISER_PREFILTER_FAST;
+   DenoiserQuality quality = DENOISER_QUALITY_HIGH;
+ 
++  /* DLSS 5 NR appearance controls. These reach the model directly and are
++   * inert for every other denoiser. Style, structure and tone each move the
++   * image far more than the denoiser's own run to run variation; skin does
++   * nothing unless auto_mask is on, because the mask is what gives the model
++   * something material specific to act on. */
++  int dlss5nr_style = 1;
++  float dlss5nr_intensity = 1.0f;
++  float dlss5nr_tone = 1.0f;
++  float dlss5nr_structure = 1.0f;
++  /* Negative leaves the model's own default alone. */
++  float dlss5nr_skin = -1.0f;
++  bool dlss5nr_auto_mask = false;
++
+   static const NodeEnum *get_type_enum();
+   static const NodeEnum *get_prefilter_enum();
+   static const NodeEnum *get_quality_enum();
 diff --git a/intern/cycles/device/optix/device.cpp b/intern/cycles/device/optix/device.cpp
 index 606c203e..64abd1d7 100644
 --- a/intern/cycles/device/optix/device.cpp
@@ -197,10 +362,10 @@ index b5791118..a94a9b20 100644
        return make_unique<OptiXDenoiser>(single_denoiser_device, effective_denoiser_params);
 diff --git a/intern/cycles/integrator/denoiser_dlss5nr.cpp b/intern/cycles/integrator/denoiser_dlss5nr.cpp
 new file mode 100644
-index 00000000..f4561ab2
+index 00000000..b2f64724
 --- /dev/null
 +++ b/intern/cycles/integrator/denoiser_dlss5nr.cpp
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,334 @@
 +/* SPDX-FileCopyrightText: 2026 Blender DLSS5 NR contributors
 + *
 + * SPDX-License-Identifier: Apache-2.0 */
@@ -208,6 +373,7 @@ index 00000000..f4561ab2
 +#include "integrator/denoiser_dlss5nr.h"
 +
 +#include <algorithm>
++#include <cmath>
 +#include <cstdlib>
 +#include <string>
 +#include <vector>
@@ -290,6 +456,10 @@ index 00000000..f4561ab2
 +  init_ = reinterpret_cast<InitFn>(GetProcAddress(bridge_module_, "dlss5nr_init"));
 +  process_ = reinterpret_cast<ProcessFn>(GetProcAddress(bridge_module_, "dlss5nr_process"));
 +  shutdown_ = reinterpret_cast<ShutdownFn>(GetProcAddress(bridge_module_, "dlss5nr_shutdown"));
++  /* Optional: a bridge built before the guided path simply will not have it,
++   * and the colour only call still works. */
++  process_guided_ = reinterpret_cast<ProcessGuidedFn>(
++      GetProcAddress(bridge_module_, "dlss5nr_process_guided"));
 +  if (!init_ || !process_ || !shutdown_) {
 +    set_error("DLSS 5 NR: bridge has missing or incompatible exports.");
 +    unload_runtime();
@@ -380,12 +550,32 @@ index 00000000..f4561ab2
 +   * adaptive sampling the count is per pixel, not the scene-wide num_samples. */
 +  const int sample_count_offset = buffer_params.get_pass_offset(PASS_SAMPLE_COUNT);
 +
++  /* Guides are opportunistic. Cycles only carries these passes when the view
++   * layer asks for them, so a render without the Z and Vector passes gets the
++   * colour only path and an evaluate that resets every frame. With both present
++   * the model has frame to frame correspondence and can accumulate, which is
++   * what Ray Reconstruction is built around. */
++  const int depth_offset = buffer_params.get_pass_offset(PASS_DEPTH);
++  const int motion_offset = buffer_params.get_pass_offset(PASS_MOTION);
++  const int motion_weight_offset = buffer_params.get_pass_offset(PASS_MOTION_WEIGHT);
++  const bool use_guides = process_guided_ != nullptr && depth_offset != PASS_UNUSED &&
++                          motion_offset != PASS_UNUSED;
++  if (guides_logged_ != int(use_guides)) {
++    guides_logged_ = int(use_guides);
++    LOG_INFO << "DLSS 5 NR guides "
++             << (use_guides ? "active: depth and motion, temporal accumulation on" :
++                              "absent: colour only, resetting every frame. Enable the "
++                              "Z and Vector passes for temporal accumulation");
++  }
++
 +  render_buffers->copy_from_device();
 +  float *pixels = render_buffers->buffer.data();
 +  const size_t pixel_count = size_t(buffer_params.width) * size_t(buffer_params.height);
 +  std::vector<float> input(pixel_count * 3);
 +  std::vector<float> output(pixel_count * 3);
 +  std::vector<float> pixel_scale(pixel_count, float(num_samples));
++  std::vector<float> depth(use_guides ? pixel_count : 0);
++  std::vector<float> motion(use_guides ? pixel_count * 2 : 0);
 +
 +  for (int y = 0; y < buffer_params.height; ++y) {
 +    for (int x = 0; x < buffer_params.width; ++x) {
@@ -403,26 +593,88 @@ index 00000000..f4561ab2
 +        input[image_index * 3 + channel] =
 +            std::max(0.0f, pixels[buffer_index + noisy_offset + channel] * inv_scale);
 +      }
++      if (use_guides) {
++        /* Depth is not accumulated. The kernel writes it with
++         * film_overwrite_pass_float at sample 0 only, and PASS_DEPTH has
++         * use_filter false so Cycles' own accessor does not divide it by the
++         * sample count either. Scaling it here shrank it by exactly that
++         * count: a scene 21 units deep arrived as 0 to 1.35 at 16 samples,
++         * and at 1024 samples it would have been indistinguishable from an
++         * empty buffer. */
++        depth[image_index] = pixels[buffer_index + depth_offset];
++        /* The motion pass is accumulated against its own weight rather than the
++         * sample count, which is what divide_type on PASS_MOTION means. Only the
++         * first two components are used: they are the vector back to where this
++         * pixel was in the previous frame, which is the correspondence the model
++         * needs. The last two point at the next frame and are for vector blur. */
++        float motion_scale = inv_scale;
++        if (motion_weight_offset != PASS_UNUSED) {
++          const float weight = pixels[buffer_index + motion_weight_offset];
++          motion_scale = weight > 0.0f ? 1.0f / weight : 0.0f;
++        }
++        motion[image_index * 2 + 0] = pixels[buffer_index + motion_offset + 0] * motion_scale;
++        motion[image_index * 2 + 1] = pixels[buffer_index + motion_offset + 1] * motion_scale;
++      }
 +    }
 +  }
 +
-+  char error[1024] = {};
++    if (use_guides && !guide_stats_logged_) {
++    guide_stats_logged_ = true;
++    float dmin = depth.empty() ? 0.0f : depth[0];
++    float dmax = dmin;
++    for (const float d : depth) {
++      dmin = std::min(dmin, d);
++      dmax = std::max(dmax, d);
++    }
++    float mmax = 0.0f;
++    double msum = 0.0;
++    for (const float m : motion) {
++      mmax = std::max(mmax, std::fabs(m));
++      msum += std::fabs(m);
++    }
++    LOG_INFO << "DLSS 5 NR guide stats: depth " << dmin << " to " << dmax
++             << ", motion mean |v| " << (motion.empty() ? 0.0 : msum / motion.size())
++             << " max " << mmax;
++  }
++
++char error[1024] = {};
 +  const bool reset = width_ != buffer_params.width || height_ != buffer_params.height;
-+  if (!process_(input.data(),
++  const int ok = use_guides ? process_guided_(input.data(),
++                                             output.data(),
++                                             depth.data(),
++                                             motion.data(),
++                                             buffer_params.width,
++                                             buffer_params.height,
++                                             params_.dlss5nr_style,
++                                             0,
++                                             params_.dlss5nr_intensity,
++                                             params_.dlss5nr_tone,
++                                             params_.dlss5nr_structure,
++                                             params_.dlss5nr_skin,
++                                             params_.dlss5nr_auto_mask ? 1 : 0,
++                                             reset ? 1 : 0,
++                                             error,
++                                             sizeof(error)) :
++                              process_(input.data(),
 +                output.data(),
 +                buffer_params.width,
 +                buffer_params.height,
-+                0,    /* style: Default */
-+                0,    /* preset: Default */
-+                1.0f, /* intensity */
-+                1.0f, /* local tone strength */
-+                1.0f, /* local structure strength */
-+                -1.0f, /* skin structure: negative leaves the model default */
-+                0,    /* auto mask */
++                params_.dlss5nr_style,
++                /* Preset is passed at its default because every value across
++                 * its whole 0..3 range produced bit identical output, so either
++                 * the parameter name is wrong or the runtime ignores it. */
++                0, /* preset */
++                params_.dlss5nr_intensity,
++                params_.dlss5nr_tone,
++                params_.dlss5nr_structure,
++                /* Negative leaves the model default alone, and skin only does
++                 * anything when the auto mask is on. */
++                params_.dlss5nr_skin,
++                params_.dlss5nr_auto_mask ? 1 : 0,
 +                reset ? 1 : 0,
 +                error,
-+                sizeof(error)))
-+  {
++                sizeof(error));
++  if (!ok) {
 +    set_error(string("DLSS 5 NR evaluation failed: ") + error);
 +    failed_ = true;
 +    unload_runtime();
@@ -450,10 +702,10 @@ index 00000000..f4561ab2
 +CCL_NAMESPACE_END
 diff --git a/intern/cycles/integrator/denoiser_dlss5nr.h b/intern/cycles/integrator/denoiser_dlss5nr.h
 new file mode 100644
-index 00000000..c29a1982
+index 00000000..1889a867
 --- /dev/null
 +++ b/intern/cycles/integrator/denoiser_dlss5nr.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,89 @@
 +/* SPDX-FileCopyrightText: 2026 Blender DLSS5 NR contributors
 + *
 + * SPDX-License-Identifier: Apache-2.0 */
@@ -503,22 +755,48 @@ index 00000000..c29a1982
 +                                   int,
 +                                   char *,
 +                                   int);
++  /* Same as ProcessFn with depth and motion guides inserted after the colour
++   * buffers. Resolved separately so an older bridge without it still works. */
++  using ProcessGuidedFn = int(__cdecl *)(const float *,
++                                         float *,
++                                         const float *,
++                                         const float *,
++                                         int,
++                                         int,
++                                         int,
++                                         int,
++                                         float,
++                                         float,
++                                         float,
++                                         float,
++                                         int,
++                                         int,
++                                         char *,
++                                         int);
 +  using ShutdownFn = void(__cdecl *)();
 +
 +  HMODULE bridge_module_ = nullptr;
 +  InitFn init_ = nullptr;
 +  ProcessFn process_ = nullptr;
++  ProcessGuidedFn process_guided_ = nullptr;
 +  ShutdownFn shutdown_ = nullptr;
 +#endif
 +  bool initialized_ = false;
 +  bool failed_ = false;
++  /* Log the guide state once, and again only when it changes. Tri-state, so
++   * the first call reports even when guides are absent: that is precisely
++   * the case where the user needs to be told why nothing is accumulating. */
++  int guides_logged_ = -1;
++  /* Report the actual guide ranges once, so a plausible looking but useless
++   * depth or an all zero motion field cannot hide. */
++  bool guide_stats_logged_ = false;
 +  int width_ = 0;
 +  int height_ = 0;
 +};
 +
 +CCL_NAMESPACE_END
 diff --git a/intern/cycles/scene/integrator.cpp b/intern/cycles/scene/integrator.cpp
-index eef15d07..ff448951 100644
+index eef15d07..0e8f44c9 100644
 --- a/intern/cycles/scene/integrator.cpp
 +++ b/intern/cycles/scene/integrator.cpp
 @@ -136,6 +136,7 @@ NODE_DEFINE(Integrator)
@@ -529,3 +807,49 @@ index eef15d07..ff448951 100644
  
    static NodeEnum denoiser_prefilter_enum;
    denoiser_prefilter_enum.insert("none", DENOISER_PREFILTER_NONE);
+@@ -162,6 +163,13 @@ NODE_DEFINE(Integrator)
+   SOCKET_BOOLEAN(denoise_use_gpu, "Denoise on GPU", true);
+   SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
+ 
++  SOCKET_INT(dlss5nr_style, "DLSS5 NR Style", 1);
++  SOCKET_FLOAT(dlss5nr_intensity, "DLSS5 NR Intensity", 1.0f);
++  SOCKET_FLOAT(dlss5nr_tone, "DLSS5 NR Tone", 1.0f);
++  SOCKET_FLOAT(dlss5nr_structure, "DLSS5 NR Structure", 1.0f);
++  SOCKET_FLOAT(dlss5nr_skin, "DLSS5 NR Skin", -1.0f);
++  SOCKET_BOOLEAN(dlss5nr_auto_mask, "DLSS5 NR Auto Mask", false);
++
+   return type;
+ }
+ 
+@@ -458,6 +466,13 @@ DenoiseParams Integrator::get_denoise_params() const
+   denoise_params.prefilter = denoiser_prefilter;
+   denoise_params.quality = denoiser_quality;
+ 
++  denoise_params.dlss5nr_style = dlss5nr_style;
++  denoise_params.dlss5nr_intensity = dlss5nr_intensity;
++  denoise_params.dlss5nr_tone = dlss5nr_tone;
++  denoise_params.dlss5nr_structure = dlss5nr_structure;
++  denoise_params.dlss5nr_skin = dlss5nr_skin;
++  denoise_params.dlss5nr_auto_mask = dlss5nr_auto_mask;
++
+   return denoise_params;
+ }
+ 
+diff --git a/intern/cycles/scene/integrator.h b/intern/cycles/scene/integrator.h
+index 0672250a..2cc623a4 100644
+--- a/intern/cycles/scene/integrator.h
++++ b/intern/cycles/scene/integrator.h
+@@ -104,6 +104,13 @@ class Integrator : public Node {
+   NODE_SOCKET_API(bool, denoise_use_gpu);
+   NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
+ 
++  NODE_SOCKET_API(int, dlss5nr_style);
++  NODE_SOCKET_API(float, dlss5nr_intensity);
++  NODE_SOCKET_API(float, dlss5nr_tone);
++  NODE_SOCKET_API(float, dlss5nr_structure);
++  NODE_SOCKET_API(float, dlss5nr_skin);
++  NODE_SOCKET_API(bool, dlss5nr_auto_mask);
++
+   enum : uint32_t {
+     AO_PASS_MODIFIED = (1 << 0),
+     OBJECT_MANAGER = (1 << 1),
